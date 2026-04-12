@@ -97,3 +97,13 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)"] }
 
 [build-dependencies]
 cfg_aliases = "0.2.1"
+
+# Pin iroh/iroh-base to the aster fork for ed25519-dalek 3.0.0-pre.6 compatibility.
+# Without this, iroh-base pulled from crates.io would require pre.1 and conflict.
+[patch.crates-io]
+iroh = { git = "https://github.com/aster-rpc/iroh", branch = "main" }
+iroh-base = { git = "https://github.com/aster-rpc/iroh", branch = "main" }
+iroh-relay = { git = "https://github.com/aster-rpc/iroh", branch = "main" }
+noq = { git = "https://github.com/aster-rpc/noq", branch = "main" }
+noq-udp = { git = "https://github.com/aster-rpc/noq", branch = "main" }
+noq-proto = { git = "https://github.com/aster-rpc/noq", branch = "main" }
