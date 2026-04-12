@@ -1,3 +1,22 @@
+# iroh-docs (aster-rpc fork)
+
+This fork tracks [upstream iroh-docs](https://github.com/n0-computer/iroh-docs) and contributes security and performance fixes back. Security work covers unsafe code audit, input validation, resource bounds, and denial-of-service surface reduction.
+
+## Contributions
+
+| PR | Area | Summary | Upstream |
+|----|------|---------|----------|
+| [#1](https://github.com/aster-rpc/iroh-docs/pull/1) | Security | Improve lock safety and document unsafe channel comparison | Pending |
+| [#2](https://github.com/aster-rpc/iroh-docs/pull/2) | Security | Reduce sync message size limit from 1 GiB to 64 MiB, handle premature import stream end | Pending |
+| [#3](https://github.com/aster-rpc/iroh-docs/pull/3) | Security | Bound public key cache, add entry key size validation | Pending |
+| [#4](https://github.com/aster-rpc/iroh-docs/pull/4) | Security | Reduce clock skew tolerance, document migration memory bounds | Pending |
+
+---
+
+*Below is the original upstream README.*
+
+---
+
 # iroh-docs
 
 Multi-dimensional key-value documents with an efficient synchronization protocol.
