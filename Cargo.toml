@@ -98,3 +98,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(iroh_docsrs)"] }
 
 [build-dependencies]
 cfg_aliases = "0.2.1"
+
+# Pin to Aster rc1 forks. The fork main branches mirror upstream main.
+[patch.crates-io]
+iroh = { git = "https://github.com/aster-rpc/iroh", rev = "2f9f374298bd44b063e1eb2df02781124305a790" }
+iroh-base = { git = "https://github.com/aster-rpc/iroh", rev = "2f9f374298bd44b063e1eb2df02781124305a790" }
+iroh-relay = { git = "https://github.com/aster-rpc/iroh", rev = "2f9f374298bd44b063e1eb2df02781124305a790" }
+noq = { git = "https://github.com/aster-rpc/noq", rev = "e968659c47057b18210a4a03dc2366c65fe8f654" }
+noq-udp = { git = "https://github.com/aster-rpc/noq", rev = "e968659c47057b18210a4a03dc2366c65fe8f654" }
+noq-proto = { git = "https://github.com/aster-rpc/noq", rev = "e968659c47057b18210a4a03dc2366c65fe8f654" }
