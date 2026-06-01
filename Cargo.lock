@@ -1952,8 +1952,7 @@ dependencies = [
 [[package]]
 name = "iroh"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef865dc2d11a19fe670ff217b68ffc3b511bddf473dc3a3e120090b9f691803"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "axum",
  "backon",
@@ -2006,8 +2005,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af93d67701c00c504982154569192ad384738c0450ba1196930314b955100552"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -2069,8 +2067,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de4112c91eb64094d77df9d3112606dcf7ff216421afccd2dc762fda5a7b2879"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -2217,8 +2214,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a70030b9e71c1183bd4f88fbdbebfa1af2a5be549dd6f20a1e8ac3cd0202ee9d"
+source = "git+https://github.com/aster-rpc/iroh?rev=2f9f374298bd44b063e1eb2df02781124305a790#2f9f374298bd44b063e1eb2df02781124305a790"
 dependencies = [
  "ahash",
  "blake3",
@@ -2777,8 +2773,7 @@ dependencies = [
 [[package]]
 name = "noq"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "198b99fc085a5db1f7d259edb5ede8311e59f28cdd2687920b4313613d21a73f"
+source = "git+https://github.com/aster-rpc/noq?rev=e968659c47057b18210a4a03dc2366c65fe8f654#e968659c47057b18210a4a03dc2366c65fe8f654"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2799,8 +2794,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ab0ac774795ce1e42a7e61266e71f3be8110210630441169ac8dda403dd23f1"
+source = "git+https://github.com/aster-rpc/noq?rev=e968659c47057b18210a4a03dc2366c65fe8f654#e968659c47057b18210a4a03dc2366c65fe8f654"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -2828,8 +2822,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.0.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3c1520eacd33fd6b009e2e70116b05508ade51db5e0d315ff8bf6b702148c2b"
+source = "git+https://github.com/aster-rpc/noq?rev=e968659c47057b18210a4a03dc2366c65fe8f654#e968659c47057b18210a4a03dc2366c65fe8f654"
 dependencies = [
  "cfg_aliases",
  "libc",
