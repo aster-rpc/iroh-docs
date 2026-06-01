@@ -642,6 +642,14 @@ impl LiveActor {
             .await;
     }
 
+    async fn emit_content_ready(&mut self, namespace: NamespaceId, hash: Hash) {
+        self.subscribers
+            .send(&namespace, Event::ContentReady { hash })
+            .await;
+        self.broadcast_neighbors(namespace, &Op::ContentReady(hash))
+            .await;
+    }
+
     async fn on_download_ready(
         &mut self,
         namespace: NamespaceId,
@@ -651,12 +659,7 @@ impl LiveActor {
         let completed_namespaces = self.queued_hashes.remove_hash(&hash);
         debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
         if res.is_ok() {
-            self.subscribers
-                .send(&namespace, Event::ContentReady { hash })
-                .await;
-            // Inform our neighbors that we have new content ready.
-            self.broadcast_neighbors(namespace, &Op::ContentReady(hash))
-                .await;
+            self.emit_content_ready(namespace, hash).await;
         } else {
             self.missing_hashes.insert(hash);
         }
@@ -750,7 +753,10 @@ impl LiveActor {
     ) {
         let entry_status = self.bao_store.blobs().status(hash).await;
         if matches!(entry_status, Ok(BlobStatus::Complete { .. })) {
-            self.missing_hashes.remove(&hash);
+            let was_missing = self.missing_hashes.remove(&hash);
+            if !only_if_missing || was_missing {
+                self.emit_content_ready(namespace, hash).await;
+            }
             return;
         }
         self.hash_providers
