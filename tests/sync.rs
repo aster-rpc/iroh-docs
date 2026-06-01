@@ -132,6 +132,63 @@ async fn sync_simple() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[traced_test]
+async fn sync_emits_content_ready_for_already_local_content() -> Result<()> {
+    let mut rng = test_rng(b"sync_emits_content_ready_for_already_local_content");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let peer0 = nodes[0].id();
+    let author0 = clients[0].docs().author_create().await?;
+    let doc0 = clients[0].docs().create().await?;
+    let hash0 = doc0
+        .set_bytes(author0, b"k1".to_vec(), b"v1".to_vec())
+        .await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    let preloaded = clients[1]
+        .blobs()
+        .add_bytes(Bytes::from_static(b"v1"))
+        .await?;
+    assert_eq!(preloaded.hash, hash0);
+
+    let doc1 = clients[1].docs().import(ticket).await?;
+    let blobs1 = clients[1].blobs();
+    let mut events1 = doc1.subscribe().await?;
+
+    assert_next_unordered(
+        &mut events1,
+        TIMEOUT,
+        vec![
+            Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer0)),
+            Box::new(move |e| {
+                matches!(
+                    e,
+                    LiveEvent::InsertRemote {
+                        from,
+                        entry,
+                        content_status: ContentStatus::Complete,
+                        ..
+                    } if *from == peer0 && entry.content_hash() == hash0
+                )
+            }),
+            Box::new(move |e| match_sync_finished(e, peer0)),
+            Box::new(move |e| matches!(e, LiveEvent::ContentReady { hash } if *hash == hash0)),
+            match_event!(LiveEvent::PendingContentReady),
+        ],
+    )
+    .await;
+    assert_latest(blobs1, &doc1, b"k1", b"v1").await;
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
 /// Test subscribing to replica events (without sync)
 #[tokio::test]
 #[traced_test]
