@@ -34,8 +34,6 @@ mod state;
 /// Capacity of the channel for the [`ToLiveActor`] messages.
 const ACTOR_CHANNEL_CAP: usize = 64;
 /// Capacity for the channels for [`Engine::subscribe`].
-const SUBSCRIBE_CHANNEL_CAP: usize = 256;
-
 /// The sync engine coordinates actors that manage open documents, set-reconciliation syncs with
 /// peers and a gossip swarm for each syncing document.
 #[derive(derive_more::Debug)]
@@ -209,7 +207,7 @@ impl Engine {
 
         // Subscribe to insert events from the replica.
         let a = {
-            let (s, r) = async_channel::bounded(SUBSCRIBE_CHANNEL_CAP);
+            let (s, r) = async_channel::unbounded();
             self.sync.subscribe(namespace, s).await?;
             Box::pin(r).then(move |ev| {
                 let content_status_cb = content_status_cb.clone();
@@ -219,7 +217,7 @@ impl Engine {
 
         // Subscribe to events from the [`live::Actor`].
         let b = {
-            let (s, r) = async_channel::bounded(SUBSCRIBE_CHANNEL_CAP);
+            let (s, r) = async_channel::unbounded();
             let r = Box::pin(r);
             let (reply, reply_rx) = oneshot::channel();
             self.to_live_actor
