@@ -31,7 +31,6 @@ use crate::{
         connect_and_sync, handle_connection, AbortReason, AcceptError, AcceptOutcome, ConnectError,
         SyncFinished,
     },
-    store::Query,
     AuthorHeads, ContentStatus, NamespaceId, SignedEntry,
 };
 
@@ -168,7 +167,7 @@ pub struct LiveActor {
     /// Running download futures.
     download_tasks: JoinSet<DownloadRes>,
     /// Content hashes which are wanted but not yet queued because no provider was found.
-    missing_hashes: HashSet<Hash>,
+    missing_hashes: MissingHashes,
     /// Content hashes queued in downloader.
     queued_hashes: QueuedHashes,
     /// Nodes known to have a hash
@@ -631,38 +630,19 @@ impl LiveActor {
     }
 
     async fn redrive_missing_content_for_peer(&mut self, namespace: NamespaceId, peer: PublicKey) {
-        let download_policy = match self.sync.get_download_policy(namespace).await {
-            Ok(policy) => policy,
-            Err(err) => {
-                warn!(?err, namespace = %namespace.fmt_short(), "failed to read download policy");
-                return;
-            }
-        };
-        let (tx, mut rx) = irpc::channel::mpsc::channel(64);
-        if let Err(err) = self.sync.get_many(namespace, Query::all().into(), tx).await {
-            warn!(?err, namespace = %namespace.fmt_short(), "failed to query entries for content redrive");
+        let missing = self.missing_hashes.hashes_for_namespace(&namespace);
+        if missing.is_empty() {
             return;
         }
 
-        while let Ok(Some(entry)) = rx.recv().await {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    warn!(?err, namespace = %namespace.fmt_short(), "failed to read entry for content redrive");
-                    continue;
-                }
-            };
-            if !download_policy.matches(entry.entry()) {
-                continue;
-            }
-            let hash = entry.content_hash();
-            if matches!(
-                self.bao_store.blobs().status(hash).await,
-                Ok(BlobStatus::Complete { .. })
-            ) {
-                continue;
-            }
-            self.start_download(namespace, hash, peer, false).await;
+        debug!(
+            namespace = %namespace.fmt_short(),
+            peer = %peer.fmt_short(),
+            missing = missing.len(),
+            "redrive missing content",
+        );
+        for hash in missing {
+            self.start_download(namespace, hash, peer, true).await;
         }
     }
 
@@ -701,9 +681,14 @@ impl LiveActor {
         let completed_namespaces = self.queued_hashes.remove_hash(&hash);
         debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
         if res.is_ok() {
-            self.emit_content_ready(namespace, hash).await;
+            for namespace in completed_namespaces.iter().copied() {
+                self.missing_hashes.remove(hash, &namespace);
+                self.emit_content_ready(namespace, hash).await;
+            }
         } else {
-            self.missing_hashes.insert(hash);
+            for namespace in &completed_namespaces {
+                self.missing_hashes.insert(hash, *namespace);
+            }
         }
         for namespace in completed_namespaces.iter() {
             if let Some(true) = self.state.may_emit_ready(namespace) {
@@ -777,7 +762,7 @@ impl LiveActor {
                         let node_id = PublicKey::from_bytes(&from)?;
                         self.start_download(namespace, hash, node_id, false).await;
                     } else {
-                        self.missing_hashes.insert(hash);
+                        self.missing_hashes.insert(hash, namespace);
                     }
                 }
             }
@@ -795,7 +780,7 @@ impl LiveActor {
     ) {
         let entry_status = self.bao_store.blobs().status(hash).await;
         if matches!(entry_status, Ok(BlobStatus::Complete { .. })) {
-            let was_missing = self.missing_hashes.remove(&hash);
+            let was_missing = self.missing_hashes.remove(hash, &namespace);
             if !only_if_missing || was_missing {
                 self.emit_content_ready(namespace, hash).await;
             }
@@ -810,7 +795,7 @@ impl LiveActor {
             .insert(node);
         if self.queued_hashes.contains_hash(&hash) {
             self.queued_hashes.insert(hash, namespace);
-        } else if !only_if_missing || self.missing_hashes.contains(&hash) {
+        } else if !only_if_missing || self.missing_hashes.contains(hash, &namespace) {
             let req = DownloadRequest::new(
                 HashAndFormat::raw(hash),
                 self.hash_providers.clone(),
@@ -819,7 +804,7 @@ impl LiveActor {
             let handle = self.downloader.download_with_opts(req);
 
             self.queued_hashes.insert(hash, namespace);
-            self.missing_hashes.remove(&hash);
+            self.missing_hashes.remove(hash, &namespace);
             self.download_tasks.spawn(async move {
                 (
                     namespace,
@@ -943,6 +928,12 @@ struct QueuedHashes {
     by_namespace: HashMap<NamespaceId, HashSet<Hash>>,
 }
 
+#[derive(Debug, Default)]
+struct MissingHashes {
+    by_hash: HashMap<Hash, HashSet<NamespaceId>>,
+    by_namespace: HashMap<NamespaceId, HashSet<Hash>>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct ProviderNodes(Arc<std::sync::Mutex<HashMap<Hash, HashSet<EndpointId>>>>);
 
@@ -991,6 +982,48 @@ impl QueuedHashes {
 
     fn contains_namespace(&self, namespace: &NamespaceId) -> bool {
         self.by_namespace.contains_key(namespace)
+    }
+}
+
+impl MissingHashes {
+    fn insert(&mut self, hash: Hash, namespace: NamespaceId) {
+        self.by_hash.entry(hash).or_default().insert(namespace);
+        self.by_namespace.entry(namespace).or_default().insert(hash);
+    }
+
+    fn remove(&mut self, hash: Hash, namespace: &NamespaceId) -> bool {
+        let mut removed = false;
+        let mut remove_hash = false;
+        if let Some(namespaces) = self.by_hash.get_mut(&hash) {
+            removed = namespaces.remove(namespace);
+            remove_hash = namespaces.is_empty();
+        }
+        if remove_hash {
+            self.by_hash.remove(&hash);
+        }
+
+        let mut remove_namespace = false;
+        if let Some(hashes) = self.by_namespace.get_mut(namespace) {
+            hashes.remove(&hash);
+            remove_namespace = hashes.is_empty();
+        }
+        if remove_namespace {
+            self.by_namespace.remove(namespace);
+        }
+        removed
+    }
+
+    fn contains(&self, hash: Hash, namespace: &NamespaceId) -> bool {
+        self.by_namespace
+            .get(namespace)
+            .is_some_and(|hashes| hashes.contains(&hash))
+    }
+
+    fn hashes_for_namespace(&self, namespace: &NamespaceId) -> Vec<Hash> {
+        self.by_namespace
+            .get(namespace)
+            .map(|hashes| hashes.iter().copied().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1050,5 +1083,37 @@ mod tests {
         drop(a_rx);
         drop(b_rx);
         subscribers.send(Event::NeighborUp(pk)).await;
+    }
+
+    #[test]
+    fn missing_hashes_are_tracked_per_namespace() {
+        let h1 = Hash::new(b"h1");
+        let h2 = Hash::new(b"h2");
+        let n1 = NamespaceId::from(&[1; 32]);
+        let n2 = NamespaceId::from(&[2; 32]);
+
+        let mut missing = MissingHashes::default();
+        missing.insert(h1, n1);
+        missing.insert(h1, n2);
+        missing.insert(h2, n1);
+
+        assert!(missing.contains(h1, &n1));
+        assert!(missing.contains(h1, &n2));
+        assert!(missing.contains(h2, &n1));
+        assert!(!missing.contains(h2, &n2));
+
+        let n1_hashes = missing.hashes_for_namespace(&n1);
+        assert_eq!(n1_hashes.len(), 2);
+        assert!(n1_hashes.contains(&h1));
+        assert!(n1_hashes.contains(&h2));
+
+        assert!(missing.remove(h1, &n1));
+        assert!(!missing.contains(h1, &n1));
+        assert!(missing.contains(h1, &n2));
+        assert_eq!(missing.hashes_for_namespace(&n1), vec![h2]);
+
+        assert!(missing.remove(h1, &n2));
+        assert!(!missing.contains(h1, &n2));
+        assert!(missing.hashes_for_namespace(&n2).is_empty());
     }
 }
