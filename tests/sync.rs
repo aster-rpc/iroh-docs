@@ -2,7 +2,7 @@ use std::{collections::HashMap, future::Future, sync::Arc};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use iroh::{endpoint::presets, Endpoint, PublicKey, SecretKey};
+use iroh::{endpoint::presets, Endpoint, EndpointAddr, PublicKey, SecretKey};
 use iroh_blobs::Hash;
 use iroh_docs::{
     api::{
@@ -182,6 +182,86 @@ async fn sync_emits_content_ready_for_already_local_content() -> Result<()> {
     )
     .await;
     assert_latest(blobs1, &doc1, b"k1", b"v1").await;
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
+    let mut rng = test_rng(b"sync_redrives_known_missing_content_after_resync");
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let peer0 = nodes[0].id();
+    let author0 = clients[0].docs().author_create().await?;
+    let doc0 = clients[0].docs().create().await?;
+    let payload = Bytes::from_static(b"content that appears after the entry");
+    let hash = Hash::new(&payload);
+    doc0.set_hash(
+        author0,
+        b"late-content".to_vec(),
+        hash,
+        payload.len() as u64,
+    )
+    .await?;
+    let ticket = doc0
+        .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+        .await?;
+
+    let (doc1, mut events1) = clients[1].docs().import_and_subscribe(ticket).await?;
+    let blobs1 = clients[1].blobs();
+
+    assert_next_unordered(
+        &mut events1,
+        TIMEOUT,
+        vec![
+            Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer0)),
+            Box::new(move |e| match_sync_finished(e, peer0)),
+            Box::new(move |e| {
+                matches!(
+                    e,
+                    LiveEvent::InsertRemote {
+                        from,
+                        entry,
+                        content_status: ContentStatus::Missing,
+                        ..
+                    } if *from == peer0 && entry.content_hash() == hash
+                )
+            }),
+            match_event!(LiveEvent::PendingContentReady),
+        ],
+    )
+    .await;
+    assert_eq!(get_all(&doc1).await?.len(), 1);
+    assert!(
+        blobs1.get_bytes(hash).await.is_err(),
+        "content should not be available before the provider stores it"
+    );
+
+    let added = clients[0].blobs().add_bytes(payload).await?;
+    assert_eq!(added.hash, hash);
+
+    doc1.start_sync(vec![EndpointAddr::new(peer0)]).await?;
+    assert_next_unordered(
+        &mut events1,
+        TIMEOUT,
+        vec![
+            Box::new(move |e| match_sync_finished(e, peer0)),
+            Box::new(
+                move |e| matches!(e, LiveEvent::ContentReady { hash: ready } if *ready == hash),
+            ),
+            match_event!(LiveEvent::PendingContentReady),
+        ],
+    )
+    .await;
+    assert_eq!(
+        blobs1.get_bytes(hash).await?.as_ref(),
+        b"content that appears after the entry"
+    );
 
     for node in nodes {
         node.shutdown().await?;

@@ -31,6 +31,7 @@ use crate::{
         connect_and_sync, handle_connection, AbortReason, AcceptError, AcceptOutcome, ConnectError,
         SyncFinished,
     },
+    store::Query,
     AuthorHeads, ContentStatus, NamespaceId, SignedEntry,
 };
 
@@ -594,6 +595,7 @@ impl LiveActor {
             return;
         };
 
+        let sync_succeeded = result_for_event.is_ok();
         let ev = SyncEvent {
             peer,
             origin,
@@ -604,6 +606,10 @@ impl LiveActor {
         self.subscribers
             .send(&namespace, Event::SyncFinished(ev))
             .await;
+
+        if sync_succeeded {
+            self.redrive_missing_content_for_peer(namespace, peer).await;
+        }
 
         // Check if there are queued pending content hashes for this namespace.
         // If hashes are pending, mark this namespace to be eglible for a PendingContentReady event once all
@@ -621,6 +627,42 @@ impl LiveActor {
 
         if resync {
             self.sync_with_peer(namespace, peer, SyncReason::Resync);
+        }
+    }
+
+    async fn redrive_missing_content_for_peer(&mut self, namespace: NamespaceId, peer: PublicKey) {
+        let download_policy = match self.sync.get_download_policy(namespace).await {
+            Ok(policy) => policy,
+            Err(err) => {
+                warn!(?err, namespace = %namespace.fmt_short(), "failed to read download policy");
+                return;
+            }
+        };
+        let (tx, mut rx) = irpc::channel::mpsc::channel(64);
+        if let Err(err) = self.sync.get_many(namespace, Query::all().into(), tx).await {
+            warn!(?err, namespace = %namespace.fmt_short(), "failed to query entries for content redrive");
+            return;
+        }
+
+        while let Ok(Some(entry)) = rx.recv().await {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!(?err, namespace = %namespace.fmt_short(), "failed to read entry for content redrive");
+                    continue;
+                }
+            };
+            if !download_policy.matches(entry.entry()) {
+                continue;
+            }
+            let hash = entry.content_hash();
+            if matches!(
+                self.bao_store.blobs().status(hash).await,
+                Ok(BlobStatus::Complete { .. })
+            ) {
+                continue;
+            }
+            self.start_download(namespace, hash, peer, false).await;
         }
     }
 
