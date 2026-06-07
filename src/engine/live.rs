@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    mem,
     sync::Arc,
 };
 
@@ -142,6 +143,16 @@ type SyncConnectRes = (
 type SyncAcceptRes = Result<SyncFinished, AcceptError>;
 type DownloadRes = (NamespaceId, Hash, Result<(), anyhow::Error>);
 
+const MAX_REPLICA_EVENT_BATCH: usize = 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadCandidate {
+    namespace: NamespaceId,
+    hash: Hash,
+    node: PublicKey,
+    only_if_missing: bool,
+}
+
 // Currently peers might double-sync in both directions.
 pub struct LiveActor {
     /// Receiver for actor messages.
@@ -172,6 +183,8 @@ pub struct LiveActor {
     queued_hashes: QueuedHashes,
     /// Nodes known to have a hash
     hash_providers: ProviderNodes,
+    /// Download scheduling candidates collected while draining replica events.
+    pending_downloads: Vec<DownloadCandidate>,
 
     /// Subscribers to actor events
     subscribers: SubscribersMap,
@@ -216,6 +229,7 @@ impl LiveActor {
             missing_hashes: Default::default(),
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
+            pending_downloads: Default::default(),
             metrics,
         })
     }
@@ -261,9 +275,7 @@ impl LiveActor {
                     trace!(?i, "tick: replica_event");
                     self.metrics.doc_live_tick_replica_event.inc();
                     let event = event.context("replica_events closed")?;
-                    if let Err(err) = self.on_replica_event(event).await {
-                        error!(?err, "Failed to process replica event");
-                    }
+                    self.on_replica_events(event).await;
                 }
                 Some(res) = self.running_sync_connect.join_next(), if !self.running_sync_connect.is_empty() => {
                     trace!(?i, "tick: running_sync_connect");
@@ -291,6 +303,27 @@ impl LiveActor {
                 }
             }
         }
+    }
+
+    async fn on_replica_events(&mut self, first: crate::Event) {
+        if let Err(err) = self.on_replica_event(first).await {
+            error!(?err, "Failed to process replica event");
+        }
+
+        for _ in 0..MAX_REPLICA_EVENT_BATCH {
+            match self.replica_events_rx.try_recv() {
+                Ok(event) => {
+                    self.metrics.doc_live_tick_replica_event.inc();
+                    if let Err(err) = self.on_replica_event(event).await {
+                        error!(?err, "Failed to process replica event");
+                    }
+                }
+                Err(async_channel::TryRecvError::Empty) => break,
+                Err(async_channel::TryRecvError::Closed) => break,
+            }
+        }
+
+        self.flush_pending_downloads().await;
     }
 
     async fn on_actor_message(&mut self, msg: ToLiveActor) -> anyhow::Result<bool> {
@@ -642,8 +675,9 @@ impl LiveActor {
             "redrive missing content",
         );
         for hash in missing {
-            self.start_download(namespace, hash, peer, true).await;
+            self.queue_download(namespace, hash, peer, true);
         }
+        self.flush_pending_downloads().await;
     }
 
     async fn broadcast_neighbors(&mut self, namespace: NamespaceId, op: &Op) {
@@ -678,19 +712,19 @@ impl LiveActor {
         hash: Hash,
         res: Result<(), anyhow::Error>,
     ) {
-        let completed_namespaces = self.queued_hashes.remove_hash(&hash);
-        debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), completed_namespaces=completed_namespaces.len(), "download ready");
+        let removed = self.queued_hashes.remove_hash(&hash);
+        debug!(namespace=%namespace.fmt_short(), success=res.is_ok(), namespaces=removed.namespaces.len(), completed_namespaces=removed.completed_namespaces.len(), "download ready");
         if res.is_ok() {
-            for namespace in completed_namespaces.iter().copied() {
+            for namespace in removed.namespaces.iter().copied() {
                 self.missing_hashes.remove(hash, &namespace);
                 self.emit_content_ready(namespace, hash).await;
             }
         } else {
-            for namespace in &completed_namespaces {
+            for namespace in &removed.namespaces {
                 self.missing_hashes.insert(hash, *namespace);
             }
         }
-        for namespace in completed_namespaces.iter() {
+        for namespace in removed.completed_namespaces.iter() {
             if let Some(true) = self.state.may_emit_ready(namespace) {
                 self.subscribers
                     .send(namespace, Event::PendingContentReady)
@@ -705,7 +739,8 @@ impl LiveActor {
         node: EndpointId,
         hash: Hash,
     ) {
-        self.start_download(namespace, hash, node, true).await;
+        self.queue_download(namespace, hash, node, true);
+        self.flush_pending_downloads().await;
     }
 
     #[instrument("on_sync_report", skip_all, fields(peer = %from.fmt_short(), namespace = %report.namespace.fmt_short()))]
@@ -760,7 +795,7 @@ impl LiveActor {
                     let hash = entry.content_hash();
                     if matches!(remote_content_status, ContentStatus::Complete) {
                         let node_id = PublicKey::from_bytes(&from)?;
-                        self.start_download(namespace, hash, node_id, false).await;
+                        self.queue_download(namespace, hash, node_id, false);
                     } else {
                         self.missing_hashes.insert(hash, namespace);
                     }
@@ -771,48 +806,138 @@ impl LiveActor {
         Ok(())
     }
 
-    async fn start_download(
+    fn queue_download(
         &mut self,
         namespace: NamespaceId,
         hash: Hash,
         node: PublicKey,
         only_if_missing: bool,
     ) {
-        let entry_status = self.bao_store.blobs().status(hash).await;
-        if matches!(entry_status, Ok(BlobStatus::Complete { .. })) {
-            let was_missing = self.missing_hashes.remove(hash, &namespace);
-            if !only_if_missing || was_missing {
-                self.emit_content_ready(namespace, hash).await;
-            }
+        self.pending_downloads.push(DownloadCandidate {
+            namespace,
+            hash,
+            node,
+            only_if_missing,
+        });
+    }
+
+    async fn flush_pending_downloads(&mut self) {
+        let pending = mem::take(&mut self.pending_downloads);
+        if pending.is_empty() {
             return;
         }
-        self.hash_providers
-            .0
-            .lock()
-            .expect("poisoned")
-            .entry(hash)
-            .or_default()
-            .insert(node);
-        if self.queued_hashes.contains_hash(&hash) {
-            self.queued_hashes.insert(hash, namespace);
-        } else if !only_if_missing || self.missing_hashes.contains(hash, &namespace) {
+
+        let mut by_hash: HashMap<Hash, Vec<DownloadCandidate>> = HashMap::new();
+        for candidate in pending {
+            by_hash.entry(candidate.hash).or_default().push(candidate);
+        }
+
+        let hashes = by_hash.keys().copied().collect::<Vec<_>>();
+        let statuses = match self
+            .bao_store
+            .blobs()
+            .status_many(hashes.iter().copied())
+            .await
+        {
+            Ok(statuses) if statuses.len() == hashes.len() => statuses,
+            Ok(statuses) => {
+                warn!(
+                    requested = hashes.len(),
+                    received = statuses.len(),
+                    "blob status batch response length mismatch; falling back to per-hash status"
+                );
+                self.status_hashes_one_by_one(&hashes).await
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    requested = hashes.len(),
+                    "blob status batch failed; falling back to per-hash status"
+                );
+                self.status_hashes_one_by_one(&hashes).await
+            }
+        };
+
+        for (hash, status) in hashes.into_iter().zip(statuses) {
+            let Some(candidates) = by_hash.remove(&hash) else {
+                continue;
+            };
+
+            if matches!(status, BlobStatus::Complete { .. }) {
+                for candidate in candidates {
+                    let was_missing = self.missing_hashes.remove(hash, &candidate.namespace);
+                    if !candidate.only_if_missing || was_missing {
+                        self.emit_content_ready(candidate.namespace, hash).await;
+                    }
+                }
+                continue;
+            }
+
+            self.record_hash_providers(hash, &candidates);
+
+            if self.queued_hashes.contains_hash(&hash) {
+                for candidate in candidates {
+                    self.queued_hashes.insert(hash, candidate.namespace);
+                }
+                continue;
+            }
+
+            let namespaces = candidates
+                .iter()
+                .filter(|candidate| self.download_candidate_is_eligible(hash, candidate))
+                .map(|candidate| candidate.namespace)
+                .collect::<HashSet<_>>();
+
+            if namespaces.is_empty() {
+                continue;
+            }
+
             let req = DownloadRequest::new(
                 HashAndFormat::raw(hash),
                 self.hash_providers.clone(),
                 SplitStrategy::None,
             );
             let handle = self.downloader.download_with_opts(req);
+            let download_namespace = candidates[0].namespace;
 
-            self.queued_hashes.insert(hash, namespace);
-            self.missing_hashes.remove(hash, &namespace);
+            for namespace in namespaces {
+                self.queued_hashes.insert(hash, namespace);
+                self.missing_hashes.remove(hash, &namespace);
+            }
             self.download_tasks.spawn(async move {
                 (
-                    namespace,
+                    download_namespace,
                     hash,
                     handle.await.map_err(|e| anyhow::anyhow!(e)),
                 )
             });
         }
+    }
+
+    async fn status_hashes_one_by_one(&self, hashes: &[Hash]) -> Vec<BlobStatus> {
+        let mut statuses = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            statuses.push(
+                self.bao_store
+                    .blobs()
+                    .status(*hash)
+                    .await
+                    .unwrap_or(BlobStatus::NotFound),
+            );
+        }
+        statuses
+    }
+
+    fn record_hash_providers(&mut self, hash: Hash, candidates: &[DownloadCandidate]) {
+        let mut providers = self.hash_providers.0.lock().expect("poisoned");
+        let nodes = providers.entry(hash).or_default();
+        for candidate in candidates {
+            nodes.insert(candidate.node);
+        }
+    }
+
+    fn download_candidate_is_eligible(&self, hash: Hash, candidate: &DownloadCandidate) -> bool {
+        !candidate.only_if_missing || self.missing_hashes.contains(hash, &candidate.namespace)
     }
 
     #[instrument("accept", skip_all)]
@@ -929,6 +1054,12 @@ struct QueuedHashes {
 }
 
 #[derive(Debug, Default)]
+struct RemovedQueuedHash {
+    namespaces: Vec<NamespaceId>,
+    completed_namespaces: Vec<NamespaceId>,
+}
+
+#[derive(Debug, Default)]
 struct MissingHashes {
     by_hash: HashMap<Hash, HashSet<NamespaceId>>,
     by_namespace: HashMap<NamespaceId, HashSet<Hash>>,
@@ -958,22 +1089,22 @@ impl QueuedHashes {
         self.by_namespace.entry(namespace).or_default().insert(hash);
     }
 
-    /// Remove a hash from the set of queued hashes.
-    ///
-    /// Returns a list of namespaces that are now complete (have no queued hashes anymore).
-    fn remove_hash(&mut self, hash: &Hash) -> Vec<NamespaceId> {
+    fn remove_hash(&mut self, hash: &Hash) -> RemovedQueuedHash {
         let namespaces = self.by_hash.remove(hash).unwrap_or_default();
-        let mut removed_namespaces = vec![];
+        let mut removed = RemovedQueuedHash {
+            namespaces: namespaces.iter().copied().collect(),
+            completed_namespaces: Vec::new(),
+        };
         for namespace in namespaces {
             if let Some(hashes) = self.by_namespace.get_mut(&namespace) {
                 hashes.remove(hash);
                 if hashes.is_empty() {
                     self.by_namespace.remove(&namespace);
-                    removed_namespaces.push(namespace);
+                    removed.completed_namespaces.push(namespace);
                 }
             }
         }
-        removed_namespaces
+        removed
     }
 
     fn contains_hash(&self, hash: &Hash) -> bool {
