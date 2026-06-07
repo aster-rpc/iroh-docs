@@ -177,6 +177,10 @@ enum ReplicaAction {
         query: Query,
         reply: mpsc::Sender<RpcResult<SignedEntry>>,
     },
+    GetManyVec {
+        query: Query,
+        reply: oneshot::Sender<Result<Vec<SignedEntry>>>,
+    },
     DropReplica {
         reply: oneshot::Sender<Result<()>>,
     },
@@ -470,6 +474,17 @@ impl SyncHandle {
         let action = ReplicaAction::GetMany { query, reply };
         self.send_replica(namespace, action).await?;
         Ok(())
+    }
+
+    pub async fn get_many_vec(
+        &self,
+        namespace: NamespaceId,
+        query: Query,
+    ) -> Result<Vec<SignedEntry>> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::GetManyVec { query, reply };
+        self.send_replica(namespace, action).await?;
+        rx.await?
     }
 
     pub async fn get_exact(
@@ -906,6 +921,14 @@ impl Actor {
                 self.tasks
                     .spawn_local(iter_to_irpc(reply, iter).map_ok_or_else(|_| (), |_| ()));
                 Ok(())
+            }
+            ReplicaAction::GetManyVec { query, reply } => {
+                send_reply_with(reply, self, move |this| {
+                    this.states.ensure_open(&namespace)?;
+                    this.store
+                        .get_many(namespace, query)?
+                        .collect::<Result<Vec<_>>>()
+                })
             }
             ReplicaAction::DropReplica { reply } => send_reply_with(reply, self, |this| {
                 this.close(namespace);
