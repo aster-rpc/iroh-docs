@@ -136,6 +136,17 @@ pub struct GetManyRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetManyVecRequest {
+    pub doc_id: NamespaceId,
+    pub query: Query,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetManyResponse {
+    pub entries: Vec<SignedEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GetExactRequest {
     pub doc_id: NamespaceId,
     pub key: Bytes,
@@ -327,6 +338,8 @@ pub enum DocsProtocol {
     SetHash(SetHashRequest),
     #[rpc(tx = mpsc::Sender<RpcResult<SignedEntry>>)]
     Get(GetManyRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<GetManyResponse>>)]
+    GetVec(GetManyVecRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<GetExactResponse>>)]
     GetExact(GetExactRequest),
     // #[rpc(tx = mpsc::Sender<ImportProgress>)]

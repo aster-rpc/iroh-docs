@@ -28,10 +28,10 @@ use self::{
         AddrInfoOptions, AuthorCreateRequest, AuthorDeleteRequest, AuthorExportRequest,
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
-        GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveRequest, ListRequest, OpenRequest, SetDownloadPolicyRequest,
-        SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest,
-        SubscribeRequest,
+        GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetManyVecRequest,
+        GetSyncPeersRequest, ImportRequest, LeaveRequest, ListRequest, OpenRequest,
+        SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
+        StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -94,6 +94,7 @@ impl DocsApi {
                     DocsProtocol::Set(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetHash(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Get(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::GetVec(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetExact(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ImportFile(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ExportFile(msg) => local.send((msg, tx)).await,
@@ -409,6 +410,19 @@ impl Doc {
             Ok(Err(err)) => Err(err.into()),
             Ok(Ok(res)) => Ok(res.into()),
         }))
+    }
+
+    /// Returns all entries matching the query as a collected vector.
+    pub async fn get_many_vec(&self, query: impl Into<Query>) -> Result<Vec<Entry>> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(GetManyVecRequest {
+                doc_id: self.namespace_id,
+                query: query.into(),
+            })
+            .await??;
+        Ok(response.entries.into_iter().map(Entry::from).collect())
     }
 
     /// Returns a single entry.

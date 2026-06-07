@@ -11,7 +11,7 @@ use iroh_docs::{
     },
     engine::LiveEvent,
     store::{DownloadPolicy, FilterKind, Query},
-    AuthorId, ContentStatus, Entry,
+    AuthorId, Capability, ContentStatus, Entry,
 };
 use n0_future::{
     time::{Duration, Instant},
@@ -375,6 +375,104 @@ async fn sync_gossip_bulk() -> Result<()> {
         elapsed / n_entries as u32
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn sync_large_read_import_after_peer_initiated_race() -> Result<()> {
+    let n_entries: usize = std::env::var("N_ENTRIES")
+        .map(|x| x.parse().expect("N_ENTRIES must be a number"))
+        .unwrap_or(2000);
+    let mut rng = test_rng(b"sync_large_read_import_after_peer_initiated_race");
+
+    let nodes = spawn_nodes(2, &mut rng).await?;
+    let clients = nodes.iter().map(|node| node.client()).collect::<Vec<_>>();
+
+    let peer0 = nodes[0].id();
+    let peer1 = nodes[1].id();
+    let author0 = clients[0].docs().author_create().await?;
+    let tree0 = clients[0].docs().create().await?;
+    let policy0 = clients[0].docs().create().await?;
+
+    let tree_peers = tree0
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?
+        .nodes;
+    let policy_peers = policy0
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?
+        .nodes;
+
+    let value = b"portal-content";
+    for i in 0..n_entries {
+        let key = format!("tree/object/{i:05}");
+        tree0
+            .set_bytes(author0, key.as_bytes().to_vec(), value.to_vec())
+            .await?;
+    }
+    for i in 0..6 {
+        let key = format!("policy/{i}");
+        policy0
+            .set_bytes(author0, key.as_bytes().to_vec(), value.to_vec())
+            .await?;
+    }
+
+    let addr1 = clients[1]
+        .docs()
+        .create()
+        .await?
+        .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+        .await?
+        .nodes
+        .pop()
+        .context("node1 share must include an address")?;
+
+    let tree1 = clients[1]
+        .docs()
+        .import_namespace(Capability::Read(tree0.id()))
+        .await?;
+    let policy1 = clients[1]
+        .docs()
+        .import_namespace(Capability::Read(policy0.id()))
+        .await?;
+    let tree_events = tree1.subscribe().await?;
+    let policy_events = policy1.subscribe().await?;
+
+    tree0.start_sync(vec![addr1]).await?;
+    n0_future::time::sleep(Duration::from_millis(100)).await;
+
+    let tree_start = tree1.start_sync(tree_peers);
+    let policy_start = policy1.start_sync(policy_peers);
+    tokio::try_join!(tree_start, policy_start)?;
+
+    let tree_task = wait_for_events(
+        tree_events,
+        n_entries,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == peer0),
+    );
+    let policy_task = wait_for_events(
+        policy_events,
+        6,
+        TIMEOUT,
+        |e| matches!(e, LiveEvent::InsertRemote { from, .. } if *from == peer0),
+    );
+    let (tree_inserts, policy_inserts) = tokio::try_join!(tree_task, policy_task)?;
+    assert_eq!(tree_inserts.len(), n_entries);
+    assert_eq!(policy_inserts.len(), 6);
+
+    assert_eq!(get_all(&tree1).await?.len(), n_entries);
+    assert_eq!(tree1.get_many_vec(Query::all()).await?.len(), n_entries);
+    assert_eq!(get_all(&policy1).await?.len(), 6);
+    assert!(
+        get_all(&tree0).await?.len() >= n_entries,
+        "publisher should still have all tree entries after dialing {peer1}"
+    );
+
+    for node in nodes {
+        node.shutdown().await?;
+    }
     Ok(())
 }
 

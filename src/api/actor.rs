@@ -15,11 +15,12 @@ use super::{
         CloseResponse, CreateRequest, CreateResponse, DelRequest, DelResponse, DocsMessage,
         DocsProtocol, DropRequest, DropResponse, GetDownloadPolicyRequest,
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
-        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse, LeaveRequest,
-        LeaveResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
-        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
-        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
+        GetManyResponse, GetManyVecRequest, GetSyncPeersRequest, GetSyncPeersResponse,
+        ImportRequest, ImportResponse, LeaveRequest, LeaveResponse, ListRequest, ListResponse,
+        OpenRequest, OpenResponse, SetDownloadPolicyRequest, SetDownloadPolicyResponse,
+        SetHashRequest, SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest,
+        ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse,
+        SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -114,6 +115,13 @@ impl RpcActor {
             DocsMessage::Get(get) => {
                 let WithChannels { tx, inner, .. } = get;
                 self.doc_get_many(inner, tx).await;
+            }
+            DocsMessage::GetVec(get_vec) => {
+                let WithChannels { tx, inner, .. } = get_vec;
+                let result = self.doc_get_many_vec(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send GetVec response: {}", e);
+                }
             }
             DocsMessage::GetExact(get_exact) => {
                 let WithChannels { tx, inner, .. } = get_exact;
@@ -546,6 +554,19 @@ impl RpcActor {
         if let Err(err) = self.sync.get_many(doc_id, query, reply.clone()).await {
             reply.send(Err(RpcError::new(&*err))).await.ok();
         }
+    }
+
+    pub(super) async fn doc_get_many_vec(
+        &self,
+        req: GetManyVecRequest,
+    ) -> RpcResult<GetManyResponse> {
+        let GetManyVecRequest { doc_id, query } = req;
+        let entries = self
+            .sync
+            .get_many_vec(doc_id, query)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(GetManyResponse { entries })
     }
 
     pub(super) async fn doc_get_exact(&self, req: GetExactRequest) -> RpcResult<GetExactResponse> {
