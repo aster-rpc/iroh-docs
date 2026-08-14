@@ -199,7 +199,10 @@ impl PeerState {
             // never run two syncs at the same time
             SyncState::Running { .. } => {
                 debug!("abort connect: sync already running");
-                if matches!(reason, SyncReason::SyncReport) {
+                // A NewNeighbor edge can race the initial DirectJoin. Dropping it
+                // leaves writes made after the initial reconciliation snapshot but
+                // before gossip is ready without another reconciliation trigger.
+                if matches!(reason, SyncReason::SyncReport | SyncReason::NewNeighbor) {
                     debug!("resync queued");
                     self.resync_requested = true;
                 }
@@ -252,5 +255,19 @@ fn expected_sync_direction(self_node_id: &EndpointId, other_node_id: &EndpointId
         SyncDirection::Accept
     } else {
         SyncDirection::Connect
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_neighbor_during_direct_join_requests_follow_up_sync() {
+        let mut state = PeerState::default();
+
+        assert!(state.start_connect(SyncReason::DirectJoin));
+        assert!(!state.start_connect(SyncReason::NewNeighbor));
+        assert!(state.resync_requested);
     }
 }
