@@ -162,10 +162,14 @@ impl Subscribers {
 }
 
 /// Kind of capability of the namespace.
+// `PartialEq`/`Eq`: a caller that asks the store to change a capability has to
+// be able to check what it actually got back.
 #[derive(
     Debug,
     Clone,
     Copy,
+    PartialEq,
+    Eq,
     Serialize,
     Deserialize,
     num_enum::IntoPrimitive,
@@ -260,6 +264,24 @@ impl Capability {
             Ok(false)
         }
     }
+}
+
+/// Outcome of retiring a namespace's local write authority.
+///
+/// `Busy` is a distinct outcome rather than an error string because a caller
+/// must be able to act on it: unexpected open handles mean the caller does not
+/// own what it thought it owned, which is a different situation from an I/O
+/// failure and usually a fail-closed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetireWriteAuthorityOutcome {
+    /// Write authority is retired; this is the capability kind now stored.
+    Retired(CapabilityKind),
+    /// Refused: handles are still open. Close them and retry.
+    Busy {
+        /// How many handles are outstanding. Fixed-width: this crosses an RPC
+        /// wire, where `usize` would vary with the peer's pointer size.
+        handles: u64,
+    },
 }
 
 /// Errors for capability operations

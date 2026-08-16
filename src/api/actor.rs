@@ -17,10 +17,10 @@ use super::{
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
         GetManyResponse, GetManyVecRequest, GetSyncPeersRequest, GetSyncPeersResponse,
         ImportRequest, ImportResponse, LeaveRequest, LeaveResponse, ListRequest, ListResponse,
-        OpenRequest, OpenResponse, SetDownloadPolicyRequest, SetDownloadPolicyResponse,
-        SetHashRequest, SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest,
-        ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse,
-        SubscribeRequest, SubscribeResponse,
+        OpenRequest, OpenResponse, RetireWriteAuthorityRequest, RetireWriteAuthorityResponse,
+        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
+        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
+        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -89,6 +89,13 @@ impl RpcActor {
                 let result = self.doc_drop(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send Drop response: {}", e);
+                }
+            }
+            DocsMessage::RetireWriteAuthority(msg) => {
+                let WithChannels { tx, inner, .. } = msg;
+                let result = self.doc_retire_write_authority(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send RetireWriteAuthority response: {}", e);
                 }
             }
             DocsMessage::Import(import) => {
@@ -351,6 +358,23 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(DropResponse {})
+    }
+
+    pub(super) async fn doc_retire_write_authority(
+        &self,
+        req: RetireWriteAuthorityRequest,
+    ) -> RpcResult<RetireWriteAuthorityResponse> {
+        let RetireWriteAuthorityRequest { doc_id } = req;
+        // Deliberately does not close or leave on the caller's behalf. `leave`
+        // also decrements a handle, so calling it here would hide exactly the
+        // condition this operation exists to report. A fully closed replica is
+        // not syncing anyway — `replica_if_syncing` requires it to be open.
+        let outcome = self
+            .sync
+            .retire_write_authority(doc_id)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(RetireWriteAuthorityResponse { outcome })
     }
 
     pub(super) async fn doc_list(

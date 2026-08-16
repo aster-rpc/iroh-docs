@@ -8,7 +8,7 @@ use std::{
     ops::Bound,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use iroh::{KeyParsingError, PublicKey};
 use iroh_blobs::Hash;
 use n0_future::time::SystemTime;
@@ -444,6 +444,85 @@ impl Store {
             };
             Ok(outcome)
         })
+    }
+
+    /// Retire this node's **write authority** over a namespace, keeping every
+    /// entry and blob reference.
+    ///
+    /// This is a *local* operation and nothing more. It does not revoke
+    /// anything cryptographically and does not reach any other node: a peer
+    /// holding the namespace secret still holds it. What it retires is this
+    /// store's own ability to sign new entries.
+    ///
+    /// The non-destructive counterpart to [`Self::remove_replica`]. A caller
+    /// narrowing its own access needs the records to survive — it must keep
+    /// serving reads of exactly the content it could previously write.
+    /// `remove_replica` deletes the records too, and re-importing a read
+    /// capability does nothing, because [`Capability::merge`] only ever
+    /// upgrades. Neither can express this.
+    ///
+    /// **Requires the replica to be closed.** The caller closes its handles
+    /// first; this refuses otherwise, for the same reason `remove_replica`
+    /// does — an open replica holds a `ReplicaInfo` carrying the old
+    /// capability, so proceeding would leave a live handle able to write
+    /// against a namespace the store now records as read-only. It does *not*
+    /// close anything on the caller's behalf, and it makes no claim about
+    /// invalidating handles the caller still holds.
+    ///
+    /// Commits synchronously before returning: reporting success on an
+    /// uncommitted write would let a crash undo a transition the caller has
+    /// already acted on.
+    ///
+    /// Returns the capability kind that is now **stored**, so a caller verifies
+    /// the outcome rather than assuming its request was honoured.
+    ///
+    /// Idempotent. A later import of a valid write capability upgrades again
+    /// through the ordinary merge path — this forgets the secret, it does not
+    /// blacklist the namespace.
+    pub fn retire_write_authority(&mut self, namespace: &NamespaceId) -> Result<CapabilityKind> {
+        if self.open_replicas.contains(namespace) {
+            return Err(anyhow!("replica is not closed"));
+        }
+        let kind = self.modify(|tables| {
+            // Parsed rather than overwritten blind: a namespace whose stored
+            // capability cannot be read is not one to replace with a guess.
+            // Read out and dropped before the insert, so the read borrow does
+            // not overlap the write.
+            let current = {
+                let existing = tables
+                    .namespaces
+                    .get(namespace.as_bytes())?
+                    .context("namespace not found")?;
+                let (raw_kind, raw_bytes) = existing.value();
+                Capability::from_raw(raw_kind, raw_bytes)?
+            };
+            let read = Capability::Read(current.id());
+            let (kind, bytes) = read.raw();
+            tables
+                .namespaces
+                .insert(namespace.as_bytes(), (kind, &bytes))?;
+            Ok(CapabilityKind::Read)
+        })?;
+        // `modify` explicitly does not guarantee persistence — it may share an
+        // open transaction that has not been committed. Reporting success
+        // before the commit would let a crash roll back a capability change the
+        // caller has already treated as done.
+        self.flush()?;
+        Ok(kind)
+    }
+
+    /// The capability kind currently **stored** for a namespace.
+    ///
+    /// Distinct from whatever a caller believes it imported: after a downgrade,
+    /// this is what actually governs.
+    pub fn namespace_capability_kind(&mut self, namespace: &NamespaceId) -> Result<CapabilityKind> {
+        let tables = self.tables()?;
+        let value = tables
+            .namespaces
+            .get(namespace.as_bytes())?
+            .context("namespace not found")?;
+        let (raw_kind, raw_bytes) = value.value();
+        Ok(Capability::from_raw(raw_kind, raw_bytes)?.kind())
     }
 
     /// Remove a replica.
@@ -1022,6 +1101,103 @@ fn into_entry(key: RecordsId, value: RecordsValue) -> SignedEntry {
 mod tests {
     use super::*;
     use crate::ranger::Store as _;
+
+    /// Retiring write authority keeps the entries, commits before returning,
+    /// and survives a process that never gets to shut down cleanly.
+    ///
+    /// The commit is the point. `modify` shares an open transaction and
+    /// explicitly does not guarantee persistence, so reporting success before
+    /// flushing would let a crash roll back a transition the caller has already
+    /// acted on. `std::mem::forget` models exactly that: no `Drop`, no graceful
+    /// flush, nothing but what was already committed.
+    #[tokio::test]
+    async fn retire_commits_before_returning_and_keeps_entries() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+
+        let mut store = Store::persistent(dbfile.path())?;
+        let author = store.new_author(&mut rand::rng())?;
+        let mut replica = store.new_replica(namespace.clone())?;
+        replica.hash_and_insert(b"k", &author, b"v").await?;
+        drop(replica);
+        store.close_replica(id);
+
+        assert_eq!(store.retire_write_authority(&id)?, CapabilityKind::Read);
+
+        // Read the value that is actually *committed*, through an independent
+        // read transaction — not through the store's own possibly-open write
+        // transaction, which would show uncommitted data and prove nothing.
+        // This is what a process that died here would find on the next boot.
+        {
+            use super::tables::NAMESPACES_TABLE;
+            let tx = store.db.begin_read()?;
+            let table = tx.open_table(NAMESPACES_TABLE)?;
+            let entry = table
+                .get(id.as_bytes())?
+                .context("namespace missing from the committed database")?;
+            let (raw_kind, raw_bytes) = entry.value();
+            assert_eq!(
+                Capability::from_raw(raw_kind, raw_bytes)?.kind(),
+                CapabilityKind::Read,
+                "the retirement must be committed before it is reported, or a \
+                 crash rolls back a transition the caller already acted on",
+            );
+        }
+
+        assert_eq!(
+            store.namespace_capability_kind(&id)?,
+            CapabilityKind::Read,
+            "the retirement must have been committed before it was reported",
+        );
+        let entries = store
+            .get_many(id, Query::author(author.id()))?
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "retiring write authority narrows access; it does not delete content",
+        );
+        assert_eq!(entries[0].key(), b"k");
+
+        // No signing key remains, so nothing local can write.
+        assert!(
+            store.open_replica(&id)?.secret_key().is_err(),
+            "a read-only replica must not yield a signing key",
+        );
+        store.close_replica(id);
+
+        // Idempotent.
+        assert_eq!(store.retire_write_authority(&id)?, CapabilityKind::Read);
+
+        // And a later valid write capability upgrades again: this forgets the
+        // secret, it does not blacklist the namespace.
+        let outcome = store.import_namespace(Capability::Write(namespace))?;
+        assert!(matches!(outcome, ImportNamespaceOutcome::Upgraded));
+        assert_eq!(store.namespace_capability_kind(&id)?, CapabilityKind::Write);
+        Ok(())
+    }
+
+    /// An open replica is refused, and the stored capability is untouched.
+    #[tokio::test]
+    async fn retire_refuses_an_open_replica() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let mut store = Store::persistent(dbfile.path())?;
+        let namespace = NamespaceSecret::new(&mut rand::rng());
+        let id = namespace.id();
+        let _replica = store.new_replica(namespace)?;
+
+        assert!(
+            store.retire_write_authority(&id).is_err(),
+            "fail closed rather than retire under a live writable handle",
+        );
+        assert_eq!(
+            store.namespace_capability_kind(&id)?,
+            CapabilityKind::Write,
+            "and the stored capability is unchanged",
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_ranges() -> Result<()> {
