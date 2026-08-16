@@ -17,7 +17,7 @@ use crate::{
     engine::LiveEvent,
     store::{DownloadPolicy, Query},
     Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
-    SignedEntry,
+    RetireWriteAuthorityOutcome, SignedEntry,
 };
 
 /// Progress during import operations
@@ -93,6 +93,19 @@ pub struct DropRequest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DropResponse;
+
+/// Retire this node's write authority over a document, keeping its entries.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetireWriteAuthorityRequest {
+    pub doc_id: NamespaceId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetireWriteAuthorityResponse {
+    /// Retired, with the capability kind now stored — or `Busy` with the
+    /// number of handles still open.
+    pub outcome: RetireWriteAuthorityOutcome,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ImportRequest {
@@ -319,6 +332,8 @@ pub enum DocsProtocol {
     Create(CreateRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<DropResponse>>)]
     Drop(DropRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<RetireWriteAuthorityResponse>>)]
+    RetireWriteAuthority(RetireWriteAuthorityRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<ImportResponse>>)]
     Import(ImportRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<SetResponse>>)]

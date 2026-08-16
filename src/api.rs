@@ -29,9 +29,9 @@ use self::{
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
         GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveRequest, ListRequest, OpenRequest, SetDownloadPolicyRequest,
-        SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest,
-        SubscribeRequest,
+        ImportRequest, LeaveRequest, ListRequest, OpenRequest, RetireWriteAuthorityRequest,
+        SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
+        StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -39,6 +39,7 @@ use crate::{
     engine::{Engine, LiveEvent},
     store::{DownloadPolicy, Query},
     Author, AuthorId, Capability, CapabilityKind, DocTicket, Entry, NamespaceId, PeerIdBytes,
+    RetireWriteAuthorityOutcome,
 };
 
 pub(crate) mod actor;
@@ -90,6 +91,7 @@ impl DocsApi {
                     DocsProtocol::List(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Create(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Drop(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::RetireWriteAuthority(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Import(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Set(msg) => local.send((msg, tx)).await,
                     DocsProtocol::SetHash(msg) => local.send((msg, tx)).await,
@@ -206,6 +208,52 @@ impl DocsApi {
     pub async fn drop_doc(&self, doc_id: NamespaceId) -> Result<()> {
         self.inner.rpc(DropRequest { doc_id }).await??;
         Ok(())
+    }
+
+    /// Retires this node's **write authority** over a document, keeping every
+    /// entry.
+    ///
+    /// A *local* operation only. It revokes nothing cryptographically and
+    /// reaches no other node: a peer holding the namespace secret still holds
+    /// it. What it retires is this node's own ability to sign new entries.
+    ///
+    /// The non-destructive counterpart to [`Self::drop_doc`], for a node
+    /// narrowing its own access rather than deleting the document. `drop_doc`
+    /// deletes the entries too, and re-importing a read capability does
+    /// nothing, because capability merge only ever upgrades — so neither can
+    /// express this.
+    ///
+    /// **Release every reference first**, in both senses. [`Doc::leave`] drops
+    /// the live-sync reference; [`Doc::close`] drops the caller's own document
+    /// reference and permanently invalidates that handle and its clones. Only
+    /// once the count reaches zero does this succeed; until then it refuses
+    /// with [`RetireWriteAuthorityOutcome::Busy`] and reports how many remain.
+    ///
+    /// It does not close anything on the caller's behalf. Unexpected handles
+    /// mean the caller does not own what it thought it owned, which is usually
+    /// a fail-closed situation rather than something to retry through.
+    ///
+    /// A closed handle stays closed: it cannot revive, here or later. But a
+    /// handle opened *after* retirement is a read handle on a namespace, not a
+    /// snapshot of its capability — so a later write import widens it in place.
+    /// A caller that must not widen an existing read handle has to close it
+    /// before importing write.
+    ///
+    /// On success the change is committed before this returns, and the reported
+    /// capability kind is the one now **stored** — so the caller verifies what
+    /// happened rather than assuming its request was honoured.
+    ///
+    /// Idempotent, and a later import of a valid write capability upgrades
+    /// again: this forgets the secret, it does not blacklist the document.
+    pub async fn retire_write_authority(
+        &self,
+        doc_id: NamespaceId,
+    ) -> Result<RetireWriteAuthorityOutcome> {
+        let response = self
+            .inner
+            .rpc(RetireWriteAuthorityRequest { doc_id })
+            .await??;
+        Ok(response.outcome)
     }
 
     /// Imports a document from a namespace capability.

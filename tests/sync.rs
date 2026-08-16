@@ -11,7 +11,7 @@ use iroh_docs::{
     },
     engine::LiveEvent,
     store::{DownloadPolicy, FilterKind, Query},
-    AuthorId, ContentStatus, Entry,
+    AuthorId, Capability, CapabilityKind, ContentStatus, Entry, RetireWriteAuthorityOutcome,
 };
 use n0_future::{
     time::{Duration, Instant},
@@ -1222,6 +1222,200 @@ async fn sync_drop_doc() -> Result<()> {
     let ev = sub.try_next().await?;
     assert!(ev.is_none());
 
+    Ok(())
+}
+
+/// Retiring write authority stops local writes and keeps the data — and
+/// refuses while the caller still holds handles.
+///
+/// The refusal is the contract, not a limitation worked around: `close` is a
+/// reference-count decrement, so an implementation that "just closes" retires
+/// one handle out of however many exist and silently depends on that count
+/// being one. Here three independent opens are held, and the operation reports
+/// `Busy` with the count until every one is closed.
+#[tokio::test]
+#[traced_test]
+async fn sync_retire_write_authority() -> Result<()> {
+    let mut rng = test_rng(b"sync_retire_write_authority");
+    let node = spawn_node(0, &mut rng).await?;
+    let client = node.client();
+
+    let doc = client.docs().create().await?;
+    let id = doc.id();
+    let author = client.docs().author_create().await?;
+    doc.set_bytes(author, b"foo".to_vec(), b"bar".to_vec())
+        .await?;
+
+    // Two more independent opens, so the handle count is three.
+    let second = client.docs().open(id).await?.expect("open");
+    let third = client.docs().open(id).await?.expect("open");
+
+    match client.docs().retire_write_authority(id).await? {
+        RetireWriteAuthorityOutcome::Busy { handles } => assert_eq!(handles, 3),
+        other => panic!("open handles must refuse, got {other:?}"),
+    }
+    assert!(
+        doc.set_bytes(author, b"foo".to_vec(), b"baz".to_vec())
+            .await
+            .is_ok(),
+        "a refused retirement must leave write authority intact",
+    );
+
+    second.close().await?;
+    third.close().await?;
+    match client.docs().retire_write_authority(id).await? {
+        RetireWriteAuthorityOutcome::Busy { handles } => assert_eq!(
+            handles, 1,
+            "the count must reflect what is actually open, not a guess",
+        ),
+        other => panic!("one handle still open, got {other:?}"),
+    }
+
+    doc.close().await?;
+    let outcome = client.docs().retire_write_authority(id).await?;
+    assert_eq!(
+        outcome,
+        RetireWriteAuthorityOutcome::Retired(CapabilityKind::Read),
+        "the server reports what it stored, not what was asked for",
+    );
+
+    // The data survives, and a freshly opened handle cannot write.
+    let reopened = client.docs().open(id).await?.expect("still openable");
+    let entry = reopened
+        .get_exact(author, b"foo".to_vec(), false)
+        .await?
+        .expect("entries must survive an authority change");
+    assert_eq!(entry.content_len(), 3);
+    assert!(
+        reopened
+            .set_bytes(author, b"foo".to_vec(), b"qux".to_vec())
+            .await
+            .is_err(),
+        "no local write may be signed once write authority is retired",
+    );
+
+    // Idempotent — once the handle is closed again.
+    reopened.close().await?;
+    assert_eq!(
+        client.docs().retire_write_authority(id).await?,
+        RetireWriteAuthorityOutcome::Retired(CapabilityKind::Read),
+    );
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// A read handle opened after retirement **widens in place** when write is
+/// imported again.
+///
+/// A `Doc` is a namespace id, not a snapshot of the capability it was opened
+/// under, so it follows the namespace. That is the documented behaviour, and it
+/// is why a caller narrowing or widening authority must close the old handle
+/// rather than assume the handle carries the old rights.
+///
+/// A *closed* handle is a different matter: `close` sets a flag shared with
+/// every clone, so it can never revive. This API therefore claims nothing about
+/// invalidating handles a caller still holds — it requires them released.
+#[tokio::test]
+#[traced_test]
+async fn sync_read_handle_widens_when_write_is_reimported() -> Result<()> {
+    let mut rng = test_rng(b"sync_read_handle_widens_when_write_is_reimported");
+    let node = spawn_node(0, &mut rng).await?;
+    let client = node.client();
+
+    // Created from a known secret, so the same write capability can be
+    // re-imported later — modelling a node that is granted write again.
+    let secret = iroh_docs::NamespaceSecret::new(&mut rng);
+    let doc = client
+        .docs()
+        .import_namespace(Capability::Write(secret.clone()))
+        .await?;
+    let id = doc.id();
+    let author = client.docs().author_create().await?;
+    doc.set_bytes(author, b"k".to_vec(), b"v1".to_vec()).await?;
+
+    doc.close().await?;
+    assert_eq!(
+        client.docs().retire_write_authority(id).await?,
+        RetireWriteAuthorityOutcome::Retired(CapabilityKind::Read),
+    );
+    // The closed handle is closed for good — not because retirement touched
+    // it, but because `close` did.
+    assert!(
+        doc.set_bytes(author, b"k".to_vec(), b"v2".to_vec())
+            .await
+            .is_err(),
+        "a closed handle can never revive",
+    );
+
+    // A handle opened *after* retirement can read but not write.
+    let reader = client.docs().open(id).await?.expect("open");
+    assert!(
+        reader
+            .set_bytes(author, b"k".to_vec(), b"v2".to_vec())
+            .await
+            .is_err(),
+        "while retired, no handle may write",
+    );
+
+    // Re-import write: that same read handle now writes, without being
+    // reopened. It addressed the namespace, and the namespace widened.
+    let regranted = client
+        .docs()
+        .import_namespace(Capability::Write(secret))
+        .await?;
+    assert!(
+        reader
+            .set_bytes(author, b"k".to_vec(), b"v3".to_vec())
+            .await
+            .is_ok(),
+        "a read handle widens in place when the namespace does; a caller that \
+         must not widen has to close it before importing write",
+    );
+    reader.close().await?;
+    regranted.close().await?;
+    node.shutdown().await?;
+    Ok(())
+}
+
+/// Both references have to be released: the live-sync one and the caller's own.
+///
+/// `leave` drops one, `close` drops the other, and only at zero does retirement
+/// succeed. Asserting the 2 → 1 → 0 transition is what pins that an
+/// implementation cannot quietly get away with releasing one of them.
+#[tokio::test]
+#[traced_test]
+async fn sync_retire_requires_both_references_released() -> Result<()> {
+    let mut rng = test_rng(b"sync_retire_requires_both_references_released");
+    let node = spawn_node(0, &mut rng).await?;
+    let client = node.client();
+
+    let doc = client.docs().create().await?;
+    let id = doc.id();
+    let author = client.docs().author_create().await?;
+    doc.set_bytes(author, b"k".to_vec(), b"v".to_vec()).await?;
+
+    // Starting sync takes the second reference.
+    doc.start_sync(vec![]).await?;
+    assert_eq!(
+        client.docs().retire_write_authority(id).await?,
+        RetireWriteAuthorityOutcome::Busy { handles: 2 },
+        "live sync and the caller's handle are two separate references",
+    );
+
+    doc.leave().await?;
+    assert_eq!(
+        client.docs().retire_write_authority(id).await?,
+        RetireWriteAuthorityOutcome::Busy { handles: 1 },
+        "leaving releases the sync reference and nothing else",
+    );
+
+    doc.close().await?;
+    assert_eq!(
+        client.docs().retire_write_authority(id).await?,
+        RetireWriteAuthorityOutcome::Retired(CapabilityKind::Read),
+        "only at zero references may write authority be retired",
+    );
+    node.shutdown().await?;
     Ok(())
 }
 

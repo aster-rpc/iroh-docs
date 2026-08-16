@@ -29,7 +29,8 @@ use crate::{
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
     Author, AuthorHeads, AuthorId, Capability, ContentStatus, ContentStatusCallback, Event,
-    NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, SignedEntry, SyncOutcome,
+    NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, RetireWriteAuthorityOutcome,
+    SignedEntry, SyncOutcome,
 };
 
 const ACTION_CAP: usize = 1024;
@@ -54,6 +55,14 @@ enum Action {
         author: AuthorId,
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
+    },
+    /// Retire this node's write authority over a namespace, keeping its
+    /// entries. Refuses while any handle is open — the caller closes first.
+    #[display("RetireWriteAuthority")]
+    RetireWriteAuthority {
+        namespace: NamespaceId,
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<RetireWriteAuthorityOutcome>>,
     },
     #[display("NewReplica")]
     ImportNamespace {
@@ -555,6 +564,18 @@ impl SyncHandle {
         rx.await?
     }
 
+    /// Retire this node's write authority over a namespace, keeping its
+    /// entries. Refuses with `Busy` while any handle is open.
+    pub async fn retire_write_authority(
+        &self,
+        namespace: NamespaceId,
+    ) -> Result<RetireWriteAuthorityOutcome> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Action::RetireWriteAuthority { namespace, reply })
+            .await?;
+        rx.await?
+    }
+
     pub async fn import_namespace(&self, capability: Capability) -> Result<NamespaceId> {
         let (reply, rx) = oneshot::channel();
         self.send(Action::ImportNamespace { capability, reply })
@@ -733,6 +754,23 @@ impl Actor {
             }
             Action::DeleteAuthor { author, reply } => {
                 send_reply(reply, self.store.delete_author(author))
+            }
+            Action::RetireWriteAuthority { namespace, reply } => {
+                send_reply_with(reply, self, |this| {
+                    // Deliberately does **not** close anything. `close` is a
+                    // reference-count decrement, so closing here would retire
+                    // one handle out of however many the caller holds and
+                    // silently depend on that count being one. The caller owns
+                    // its handles and closes them; this only reports what it
+                    // finds.
+                    if let Ok(state) = this.states.get_mut(&namespace) {
+                        return Ok(RetireWriteAuthorityOutcome::Busy {
+                            handles: state.handles as u64,
+                        });
+                    }
+                    let capability = this.store.retire_write_authority(&namespace)?;
+                    Ok(RetireWriteAuthorityOutcome::Retired(capability))
+                })
             }
             Action::ImportNamespace { capability, reply } => send_reply_with(reply, self, |this| {
                 let id = capability.id();
