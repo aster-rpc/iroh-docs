@@ -9,7 +9,7 @@ use iroh_docs::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
-    engine::LiveEvent,
+    engine::{LiveEvent, Origin, SyncReason},
     store::{DownloadPolicy, FilterKind, Query},
     AuthorId, Capability, CapabilityKind, ContentStatus, Entry, RetireWriteAuthorityOutcome,
 };
@@ -215,7 +215,18 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
     let (doc1, mut events1) = clients[1].docs().import_and_subscribe(ticket).await?;
     let blobs1 = clients[1].blobs();
 
-    assert_next_unordered(
+    // The follow-up reconciliation queued when `NewNeighbor` races the
+    // already-running `DirectJoin` sync surfaces here as a *second*
+    // `SyncFinished`, so this cannot use the exact-count form. It is optional
+    // because the race does not always happen: before that behaviour existed
+    // this assertion passed 20/20, and with it the extra event appears in
+    // roughly one run in five.
+    //
+    // Matched precisely rather than by ignoring surplus `SyncFinished` events.
+    // A redundant resync that reconciles *nothing* is the designed cost of not
+    // losing a reconciliation; one that moves entries would mean the first sync
+    // did not finish what it claimed, and this still fails on that.
+    assert_next_unordered_with_optionals(
         &mut events1,
         TIMEOUT,
         vec![
@@ -234,6 +245,7 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
             }),
             match_event!(LiveEvent::PendingContentReady),
         ],
+        vec![Box::new(move |e| match_empty_resync_finished(e, peer0))],
     )
     .await;
     assert_eq!(get_all(&doc1).await?.len(), 1);
@@ -246,7 +258,12 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
     assert_eq!(added.hash, hash);
 
     doc1.start_sync(vec![EndpointAddr::new(peer0)]).await?;
-    assert_next_unordered(
+    // Same optional as above, for the same reason: this `start_sync` can also
+    // race a `NewNeighbor` and queue a follow-up reconciliation. Observed
+    // failing only in the first phase, but the assertion here has the identical
+    // shape — an origin-blind required matcher and an exact event count — so
+    // leaving it would be knowingly keeping a latent copy of the same flake.
+    assert_next_unordered_with_optionals(
         &mut events1,
         TIMEOUT,
         vec![
@@ -256,6 +273,7 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
             ),
             match_event!(LiveEvent::PendingContentReady),
         ],
+        vec![Box::new(move |e| match_empty_resync_finished(e, peer0))],
     )
     .await;
     assert_eq!(
@@ -1812,4 +1830,25 @@ fn match_sync_finished(event: &LiveEvent, peer: PublicKey) -> bool {
         return false;
     };
     e.peer == peer && e.result.is_ok()
+}
+
+/// Asserts that the event is the *empty* follow-up reconciliation queued when a
+/// `NewNeighbor` request races an already-running sync.
+///
+/// Deliberately narrower than [`match_sync_finished`]: it requires the resync to
+/// have reconciled nothing in either direction. Transferring no entries is what
+/// makes a redundant resync harmless, so a test that tolerates the extra event
+/// must tolerate only that shape — otherwise it would also absorb a regression
+/// where the first sync silently failed to transfer what it reported.
+fn match_empty_resync_finished(event: &LiveEvent, peer: PublicKey) -> bool {
+    let LiveEvent::SyncFinished(e) = event else {
+        return false;
+    };
+    let Ok(details) = &e.result else {
+        return false;
+    };
+    e.peer == peer
+        && matches!(e.origin, Origin::Connect(SyncReason::Resync))
+        && details.entries_received == 0
+        && details.entries_sent == 0
 }
