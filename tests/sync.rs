@@ -9,7 +9,7 @@ use iroh_docs::{
         protocol::{AddrInfoOptions, ShareMode},
         Doc,
     },
-    engine::{LiveEvent, Origin, SyncReason},
+    engine::LiveEvent,
     store::{DownloadPolicy, FilterKind, Query},
     AuthorId, Capability, CapabilityKind, ContentStatus, Entry, RetireWriteAuthorityOutcome,
 };
@@ -215,39 +215,13 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
     let (doc1, mut events1) = clients[1].docs().import_and_subscribe(ticket).await?;
     let blobs1 = clients[1].blobs();
 
-    // The follow-up reconciliation queued when `NewNeighbor` races the
-    // already-running `DirectJoin` sync surfaces here as a *second*
-    // `SyncFinished`, so this cannot use the exact-count form. It is optional
-    // because the race does not always happen: before that behaviour existed
-    // this assertion passed 20/20, and with it the extra event appears in
-    // roughly one run in five.
-    //
-    // Matched precisely rather than by ignoring surplus `SyncFinished` events.
-    // A redundant resync that reconciles *nothing* is the designed cost of not
-    // losing a reconciliation; one that moves entries would mean the first sync
-    // did not finish what it claimed, and this still fails on that.
-    assert_next_unordered_with_optionals(
-        &mut events1,
-        TIMEOUT,
-        vec![
-            Box::new(move |e| matches!(e, LiveEvent::NeighborUp(peer) if *peer == peer0)),
-            Box::new(move |e| match_sync_finished(e, peer0)),
-            Box::new(move |e| {
-                matches!(
-                    e,
-                    LiveEvent::InsertRemote {
-                        from,
-                        entry,
-                        content_status: ContentStatus::Missing,
-                        ..
-                    } if *from == peer0 && entry.content_hash() == hash
-                )
-            }),
-            match_event!(LiveEvent::PendingContentReady),
-        ],
-        vec![Box::new(move |e| match_empty_resync_finished(e, peer0))],
-    )
-    .await;
+    // Not `assert_next_unordered_with_optionals`: its optional matchers are
+    // single-use and it stops as soon as the required set is exhausted, so it
+    // cannot model a control-plane event that may repeat and may straddle the
+    // boundary between the two phases this test invents. Sync completions are
+    // exactly such an event — a queued reconciliation can fire more than once,
+    // in either order relative to the completion the phase is waiting for.
+    drive(&mut events1, TIMEOUT, RedrivePhase1::new(peer0, hash)).await?;
     assert_eq!(get_all(&doc1).await?.len(), 1);
     assert!(
         blobs1.get_bytes(hash).await.is_err(),
@@ -258,24 +232,12 @@ async fn sync_redrives_known_missing_content_after_resync() -> Result<()> {
     assert_eq!(added.hash, hash);
 
     doc1.start_sync(vec![EndpointAddr::new(peer0)]).await?;
-    // Same optional as above, for the same reason: this `start_sync` can also
-    // race a `NewNeighbor` and queue a follow-up reconciliation. Observed
-    // failing only in the first phase, but the assertion here has the identical
-    // shape — an origin-blind required matcher and an exact event count — so
-    // leaving it would be knowingly keeping a latent copy of the same flake.
-    assert_next_unordered_with_optionals(
-        &mut events1,
-        TIMEOUT,
-        vec![
-            Box::new(move |e| match_sync_finished(e, peer0)),
-            Box::new(
-                move |e| matches!(e, LiveEvent::ContentReady { hash: ready } if *ready == hash),
-            ),
-            match_event!(LiveEvent::PendingContentReady),
-        ],
-        vec![Box::new(move |e| match_empty_resync_finished(e, peer0))],
-    )
-    .await;
+    // Which completion performs the redrive is not observable and not fixed:
+    // the explicit `start_sync` and a queued reconciliation are both eligible,
+    // and either may be the one that carries the content across. The phase
+    // therefore waits for the *shape* — a completion, then the content, then
+    // the drain — rather than for a particular origin.
+    drive(&mut events1, TIMEOUT, RedrivePhase2::new(peer0, hash)).await?;
     assert_eq!(
         blobs1.get_bytes(hash).await?.as_ref(),
         b"content that appears after the entry"
@@ -1832,23 +1794,432 @@ fn match_sync_finished(event: &LiveEvent, peer: PublicKey) -> bool {
     e.peer == peer && e.result.is_ok()
 }
 
-/// Asserts that the event is the *empty* follow-up reconciliation queued when a
-/// `NewNeighbor` request races an already-running sync.
+/// What a collector wants after being shown one event.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Keep feeding events.
+    Continue,
+    /// The phase is satisfied.
+    Done,
+}
+
+/// An event collector for one phase of the redrive test.
 ///
-/// Deliberately narrower than [`match_sync_finished`]: it requires the resync to
-/// have reconciled nothing in either direction. Transferring no entries is what
-/// makes a redundant resync harmless, so a test that tolerates the extra event
-/// must tolerate only that shape — otherwise it would also absorb a regression
-/// where the first sync silently failed to transfer what it reported.
-fn match_empty_resync_finished(event: &LiveEvent, peer: PublicKey) -> bool {
+/// Deliberately a pure state machine over `&LiveEvent` rather than a set of
+/// matchers: sync completions are a repeatable control-plane event, and a
+/// multiset assertion cannot express "one or more of these, in any order,
+/// possibly interleaved with the ones I am waiting for".
+trait Collector {
+    fn step(&mut self, event: &LiveEvent) -> Result<Step>;
+    /// What is still outstanding, for the timeout message.
+    fn outstanding(&self) -> String;
+}
+
+/// A successful completion from `peer`, whatever caused it.
+///
+/// Origin is deliberately not inspected. It identifies *why* a synchronisation
+/// started, which is real information — but it cannot establish ownership by an
+/// artificial test phase, nor which completion actually caused a redrive.
+/// Either origin may legitimately satisfy phase two.
+///
+/// Entry counts are no better a discriminator: a `DirectJoin` that reconciled
+/// nothing and a `Resync` that reconciled nothing differ in origin but have the
+/// same entry-count shape, and a queued reconciliation may itself carry entries
+/// an earlier snapshot missed. So neither field partitions "the completion this
+/// phase wants" from "some other completion".
+///
+/// A *failed* completion, or one from another peer, is still an error.
+fn successful_sync_from(event: &LiveEvent, peer: PublicKey) -> Result<bool> {
     let LiveEvent::SyncFinished(e) = event else {
-        return false;
+        return Ok(false);
     };
-    let Ok(details) = &e.result else {
-        return false;
+    if e.peer != peer {
+        bail!("sync completion from unexpected peer {}: {e:?}", e.peer);
+    }
+    if let Err(err) = &e.result {
+        bail!("sync with {peer} failed: {err}");
+    }
+    Ok(true)
+}
+
+/// Phase 1: the entry arrives, its content does not, and the queue drains.
+struct RedrivePhase1 {
+    peer: PublicKey,
+    hash: Hash,
+    neighbor_up: bool,
+    entry_seen: bool,
+    sync_seen: bool,
+    drained: bool,
+}
+
+impl RedrivePhase1 {
+    fn new(peer: PublicKey, hash: Hash) -> Self {
+        Self {
+            peer,
+            hash,
+            neighbor_up: false,
+            entry_seen: false,
+            sync_seen: false,
+            drained: false,
+        }
+    }
+}
+
+impl Collector for RedrivePhase1 {
+    fn step(&mut self, event: &LiveEvent) -> Result<Step> {
+        // Any number of successful completions are allowed, in any position.
+        // They do not consume a single-use slot, which is the whole point.
+        if successful_sync_from(event, self.peer)? {
+            self.sync_seen = true;
+        } else {
+            match event {
+                LiveEvent::NeighborUp(peer) if *peer == self.peer => self.neighbor_up = true,
+                LiveEvent::InsertRemote {
+                    from,
+                    entry,
+                    content_status: ContentStatus::Missing,
+                    ..
+                } if *from == self.peer && entry.content_hash() == self.hash => {
+                    self.entry_seen = true
+                }
+                LiveEvent::PendingContentReady => self.drained = true,
+                other => bail!("unexpected event in phase 1: {other:?}"),
+            }
+        }
+        if self.neighbor_up && self.entry_seen && self.sync_seen && self.drained {
+            Ok(Step::Done)
+        } else {
+            Ok(Step::Continue)
+        }
+    }
+
+    fn outstanding(&self) -> String {
+        let mut missing = vec![];
+        if !self.neighbor_up {
+            missing.push("NeighborUp");
+        }
+        if !self.entry_seen {
+            missing.push("InsertRemote(Missing)");
+        }
+        if !self.sync_seen {
+            missing.push("a successful SyncFinished");
+        }
+        if !self.drained {
+            missing.push("PendingContentReady");
+        }
+        missing.join(", ")
+    }
+}
+
+/// Phase 2: some completion redrives the now-available content.
+///
+/// Ordered, because the claim under test is causal: content became available
+/// *because* a later synchronisation redrove it. A `PendingContentReady` seen
+/// before that content belongs to an earlier cycle — the drain of the phase-1
+/// queue, which can land here — and resets the wait rather than satisfying it.
+struct RedrivePhase2 {
+    peer: PublicKey,
+    hash: Hash,
+    state: P2,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum P2 {
+    /// Waiting for a completion that could redrive.
+    Sync,
+    /// A completion happened; waiting for the content it should redrive.
+    Content,
+    /// Content arrived; waiting for the queue to drain.
+    Drain,
+}
+
+impl RedrivePhase2 {
+    fn new(peer: PublicKey, hash: Hash) -> Self {
+        Self {
+            peer,
+            hash,
+            state: P2::Sync,
+        }
+    }
+}
+
+impl Collector for RedrivePhase2 {
+    fn step(&mut self, event: &LiveEvent) -> Result<Step> {
+        if successful_sync_from(event, self.peer)? {
+            // A further completion while waiting for content is fine: any of
+            // them may be the one that redrives it.
+            if self.state == P2::Sync {
+                self.state = P2::Content;
+            }
+            return Ok(Step::Continue);
+        }
+        match event {
+            LiveEvent::ContentReady { hash } if *hash == self.hash => match self.state {
+                P2::Content => self.state = P2::Drain,
+                P2::Sync => bail!("content became ready before any sync completed"),
+                P2::Drain => {}
+            },
+            LiveEvent::PendingContentReady => match self.state {
+                // A drain that arrives before the content is the tail of an
+                // earlier cycle. Close it out and wait for the real one.
+                P2::Sync | P2::Content => self.state = P2::Sync,
+                P2::Drain => return Ok(Step::Done),
+            },
+            other => bail!("unexpected event in phase 2: {other:?}"),
+        }
+        Ok(Step::Continue)
+    }
+
+    fn outstanding(&self) -> String {
+        match self.state {
+            P2::Sync => "a successful SyncFinished".into(),
+            P2::Content => format!("ContentReady({})", self.hash),
+            P2::Drain => "PendingContentReady".into(),
+        }
+    }
+}
+
+/// Feed events to `collector` until it is satisfied or `timeout` elapses.
+async fn drive<C: Collector + Send>(
+    mut stream: impl Stream<Item = Result<LiveEvent>> + Unpin + Send,
+    timeout: Duration,
+    collector: C,
+) -> Result<()> {
+    // Same reason the older helper does this: the borrow has to outlive the
+    // future so the timeout arm can still report what was outstanding.
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let collector = Arc::new(parking_lot::Mutex::new(collector));
+    let (seen_in, collector_in) = (seen.clone(), collector.clone());
+    let fut = async move {
+        while let Some(event) = stream.try_next().await? {
+            seen_in.lock().push(format!("{event:?}"));
+            if collector_in.lock().step(&event)? == Step::Done {
+                return Ok(());
+            }
+        }
+        let outstanding = collector_in.lock().outstanding();
+        bail!("event stream ended, still waiting for {outstanding}")
     };
-    e.peer == peer
-        && matches!(e.origin, Origin::Connect(SyncReason::Resync))
-        && details.entries_received == 0
-        && details.entries_sent == 0
+    match n0_future::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => {
+            let outstanding = collector.lock().outstanding();
+            let seen = seen.lock();
+            bail!(
+                "timed out after {timeout:?} waiting for {outstanding}\nevents seen ({}):\n  {}",
+                seen.len(),
+                seen.join("\n  "),
+            )
+        }
+    }
+}
+
+/// Deterministic coverage for the redrive collectors.
+///
+/// The behaviour these encode is a race, so exercising them only through the
+/// live suite means the interesting orderings appear at whatever rate the
+/// scheduler happens to produce — which is how two earlier versions of this
+/// assertion were "validated" while broken. Feeding synthetic sequences pins
+/// every ordering that matters, in-process and without timing.
+#[cfg(test)]
+mod redrive_collector_tests {
+    use super::*;
+    use iroh_docs::engine::{Origin, SyncDetails, SyncEvent, SyncReason};
+    use n0_future::time::SystemTime;
+
+    fn peer() -> PublicKey {
+        SecretKey::generate().public()
+    }
+
+    fn sync(peer: PublicKey, reason: SyncReason, received: usize) -> LiveEvent {
+        LiveEvent::SyncFinished(SyncEvent {
+            peer,
+            origin: Origin::Connect(reason),
+            finished: SystemTime::UNIX_EPOCH,
+            started: SystemTime::UNIX_EPOCH,
+            result: Ok(SyncDetails {
+                entries_received: received,
+                entries_sent: 0,
+            }),
+        })
+    }
+
+    fn failed_sync(peer: PublicKey) -> LiveEvent {
+        LiveEvent::SyncFinished(SyncEvent {
+            peer,
+            origin: Origin::Connect(SyncReason::DirectJoin),
+            finished: SystemTime::UNIX_EPOCH,
+            started: SystemTime::UNIX_EPOCH,
+            result: Err("boom".into()),
+        })
+    }
+
+    /// Run a sequence through a collector; `Ok(true)` means it completed.
+    fn feed<C: Collector>(mut c: C, events: &[LiveEvent]) -> Result<bool> {
+        for e in events {
+            if c.step(e)? == Step::Done {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn hash() -> Hash {
+        Hash::new(b"late-content")
+    }
+
+    // ── phase 2: whichever synchronisation redrives, and in any order ──────
+
+    #[test]
+    fn phase2_accepts_direct_join_only() {
+        let (p, h) = (peer(), hash());
+        assert!(feed(
+            RedrivePhase2::new(p, h),
+            &[
+                sync(p, SyncReason::DirectJoin, 0),
+                LiveEvent::ContentReady { hash: h },
+                LiveEvent::PendingContentReady,
+            ],
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn phase2_accepts_resync_only() {
+        let (p, h) = (peer(), hash());
+        assert!(feed(
+            RedrivePhase2::new(p, h),
+            &[
+                sync(p, SyncReason::Resync, 0),
+                LiveEvent::ContentReady { hash: h },
+                LiveEvent::PendingContentReady,
+            ],
+        )
+        .unwrap());
+    }
+
+    /// The ordering that broke the previous fix: the resync lands first.
+    #[test]
+    fn phase2_accepts_resync_then_direct_join() {
+        let (p, h) = (peer(), hash());
+        assert!(feed(
+            RedrivePhase2::new(p, h),
+            &[
+                sync(p, SyncReason::Resync, 0),
+                sync(p, SyncReason::DirectJoin, 1),
+                LiveEvent::ContentReady { hash: h },
+                LiveEvent::PendingContentReady,
+            ],
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn phase2_accepts_direct_join_then_resync() {
+        let (p, h) = (peer(), hash());
+        assert!(feed(
+            RedrivePhase2::new(p, h),
+            &[
+                sync(p, SyncReason::DirectJoin, 0),
+                sync(p, SyncReason::Resync, 1),
+                LiveEvent::ContentReady { hash: h },
+                LiveEvent::PendingContentReady,
+            ],
+        )
+        .unwrap());
+    }
+
+    /// A drain belonging to the previous cycle must not satisfy this one.
+    #[test]
+    fn phase2_resets_on_a_stale_drain_before_the_content() {
+        let (p, h) = (peer(), hash());
+        let mut c = RedrivePhase2::new(p, h);
+        assert_eq!(
+            c.step(&sync(p, SyncReason::DirectJoin, 0)).unwrap(),
+            Step::Continue
+        );
+        // Stale drain from phase 1 arriving late: resets, does not complete.
+        assert_eq!(
+            c.step(&LiveEvent::PendingContentReady).unwrap(),
+            Step::Continue
+        );
+        assert_eq!(c.outstanding(), "a successful SyncFinished");
+        // The real cycle still completes afterwards.
+        assert_eq!(
+            c.step(&sync(p, SyncReason::Resync, 0)).unwrap(),
+            Step::Continue
+        );
+        assert_eq!(
+            c.step(&LiveEvent::ContentReady { hash: h }).unwrap(),
+            Step::Continue
+        );
+        assert_eq!(c.step(&LiveEvent::PendingContentReady).unwrap(), Step::Done);
+    }
+
+    #[test]
+    fn phase2_rejects_a_failed_completion() {
+        let (p, h) = (peer(), hash());
+        let err = feed(RedrivePhase2::new(p, h), &[failed_sync(p)]).unwrap_err();
+        assert!(err.to_string().contains("failed"), "got: {err}");
+    }
+
+    #[test]
+    fn phase2_rejects_an_unrelated_event() {
+        let (p, h) = (peer(), hash());
+        let err = feed(RedrivePhase2::new(p, h), &[LiveEvent::NeighborUp(peer())]).unwrap_err();
+        assert!(err.to_string().contains("unexpected"), "got: {err}");
+    }
+
+    #[test]
+    fn phase2_rejects_a_completion_from_another_peer() {
+        let (p, h) = (peer(), hash());
+        let err = feed(
+            RedrivePhase2::new(p, h),
+            &[sync(peer(), SyncReason::DirectJoin, 0)],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected peer"), "got: {err}");
+    }
+
+    // ── phase 1: repeatable completions must not consume a single slot ─────
+
+    #[test]
+    fn phase1_tolerates_repeated_completions_in_any_position() {
+        let (p, h) = (peer(), hash());
+        // Completions before and between the events phase 1 wants. Under the
+        // old multiset form the first of these consumed the single
+        // `SyncFinished` slot and the second had nothing left to match.
+        let mut c = RedrivePhase1::new(p, h);
+        assert_eq!(
+            c.step(&sync(p, SyncReason::Resync, 0)).unwrap(),
+            Step::Continue
+        );
+        assert_eq!(c.step(&LiveEvent::NeighborUp(p)).unwrap(), Step::Continue);
+        assert_eq!(
+            c.step(&sync(p, SyncReason::DirectJoin, 1)).unwrap(),
+            Step::Continue
+        );
+        assert_eq!(
+            c.outstanding(),
+            "InsertRemote(Missing), PendingContentReady"
+        );
+    }
+
+    #[test]
+    fn phase1_rejects_a_failed_completion() {
+        let (p, h) = (peer(), hash());
+        let err = feed(RedrivePhase1::new(p, h), &[failed_sync(p)]).unwrap_err();
+        assert!(err.to_string().contains("failed"), "got: {err}");
+    }
+
+    #[test]
+    fn phase1_rejects_an_unrelated_event() {
+        let (p, h) = (peer(), hash());
+        let err = feed(
+            RedrivePhase1::new(p, h),
+            &[LiveEvent::ContentReady { hash: h }],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected"), "got: {err}");
+    }
 }
