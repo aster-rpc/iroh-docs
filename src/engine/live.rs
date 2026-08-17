@@ -206,7 +206,15 @@ impl LiveActor {
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
-        let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
+        // Unbounded, and it must stay that way. `Subscribers::send` delivers
+        // into this channel with a blocking `tx.send(..).await` from inside the
+        // sync actor, so a bounded channel makes the sync actor stop the moment
+        // the live actor falls behind. A remote insert burst larger than the
+        // bound then wedges: with `bounded(1024)`, syncing a 2000-entry
+        // namespace stalled at exactly 1027 delivered events and never
+        // recovered. Bound the work this channel *causes* if it needs bounding
+        // (see `MAX_REPLICA_EVENT_BATCH`), never the channel itself.
+        let (replica_events_tx, replica_events_rx) = async_channel::unbounded();
         let gossip_state = GossipState::new(gossip, sync.clone(), sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
