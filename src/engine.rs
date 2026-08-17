@@ -19,7 +19,11 @@ use tracing::{debug, error, error_span, Instrument};
 
 use self::live::{LiveActor, ToLiveActor};
 pub use self::{
-    live::SyncEvent,
+    // `SyncDetails` is the `Ok` type of `SyncEvent::result`, a public field on
+    // a public struct. Without this it cannot be named outside the crate, so a
+    // consumer can read a completion but not construct one — which makes
+    // `SyncEvent` untestable downstream.
+    live::{SyncDetails, SyncEvent},
     state::{Origin, SyncReason},
 };
 use crate::{

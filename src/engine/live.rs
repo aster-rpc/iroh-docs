@@ -999,16 +999,28 @@ impl LiveActor {
 pub struct SyncEvent {
     /// Peer we synced with
     pub peer: PublicKey,
-    /// Origin of the sync exchange
+    /// Why this synchronisation started.
+    ///
+    /// This says what triggered the exchange, and nothing more. It does not
+    /// identify which synchronisation carried a particular entry or content
+    /// hash across, and two exchanges with different origins can do the same
+    /// work.
     pub origin: Origin,
-    /// Timestamp when the sync started
-    pub finished: SystemTime,
     /// Timestamp when the sync finished
+    pub finished: SystemTime,
+    /// Timestamp when the sync started
     pub started: SystemTime,
     /// Result of the sync operation
     pub result: std::result::Result<SyncDetails, String>,
 }
 
+/// What a completed synchronisation reconciled.
+///
+/// Counts only. A synchronisation that reconciled nothing is not thereby
+/// redundant — it may simply have found the other side already up to date —
+/// and one that reconciled entries is not thereby the *first* to have done so.
+/// Use these to describe what happened, not to infer which exchange was
+/// responsible for a particular entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SyncDetails {
     /// Number of entries received
