@@ -172,7 +172,7 @@ async fn connect_rejected_as_already_syncing_must_not_wedge_forever() -> Result<
     // the wedged engine refuses every one as "sync already running" and no
     // round ever starts, let alone finishes.
     let deadline = n0_future::time::Instant::now() + Duration::from_secs(60);
-    let mut round_ended = false;
+    let mut round_ended = false; // a SUCCESSFUL round, not merely an ended one
     'outer: while n0_future::time::Instant::now() < deadline {
         doc_wedged.start_sync(vec![winner_addr.clone()]).await?;
         let step = n0_future::time::sleep(Duration::from_millis(500));
@@ -184,8 +184,14 @@ async fn connect_rejected_as_already_syncing_must_not_wedge_forever() -> Result<
                     match ev {
                         Some(Ok(LiveEvent::SyncFinished(ev))) => {
                             info!(?ev, "sync round ended on the wedge candidate");
-                            round_ended = true;
-                            break 'outer;
+                            // Only a round that actually RECONCILED counts: the
+                            // fix also surfaces the aborted collision round as
+                            // a failed SyncFinished, and accepting that would
+                            // pass the test without any recovery happening.
+                            if ev.result.is_ok() {
+                                round_ended = true;
+                                break 'outer;
+                            }
                         }
                         Some(Ok(other)) => info!(?other, "event"),
                         Some(Err(e)) => info!("event error: {e:#}"),

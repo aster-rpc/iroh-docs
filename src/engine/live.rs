@@ -535,20 +535,24 @@ impl LiveActor {
         reason: SyncReason,
         result: Result<SyncFinished, ConnectError>,
     ) {
-        match result {
-            Err(ConnectError::RemoteAbort(AbortReason::AlreadySyncing)) => {
-                debug!(?reason, "remote abort, already syncing");
-            }
-            res => {
-                self.on_sync_finished(
-                    namespace,
-                    peer,
-                    Origin::Connect(reason),
-                    res.map_err(Into::into),
-                )
-                .await
-            }
-        }
+        // `RemoteAbort(AlreadySyncing)` used to be swallowed here on the bet
+        // that the reciprocal direction's sync — the one the remote preferred —
+        // would complete on our accept side and reset the state. When the
+        // remote could never reach us (a restarted peer whose address it held
+        // was stale), the bet failed permanently: the state stayed
+        // `Running{Connect}` with no timeout and no retry, and every later
+        // attempt for this (namespace, peer) was refused as already running.
+        // Routing the abort through `on_sync_finished` resets the state when
+        // the connect still owns it; `PeerState::finish` is origin-conditional,
+        // so if the reciprocal accept has already taken ownership the abort is
+        // discarded and that live exchange is left untouched.
+        self.on_sync_finished(
+            namespace,
+            peer,
+            Origin::Connect(reason),
+            result.map_err(Into::into),
+        )
+        .await
     }
 
     #[instrument("accept", skip_all, fields(peer = %fmt_accept_peer(&res), namespace = %fmt_accept_namespace(&res)))]

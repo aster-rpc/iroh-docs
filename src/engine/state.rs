@@ -178,7 +178,14 @@ impl PeerState {
                 origin: origin2,
             } => {
                 if origin2 != origin {
-                    warn!(actual = ?origin, expected = ?origin2, "finished sync origin does not match state")
+                    // The running exchange belongs to a DIFFERENT origin — for
+                    // example our rejected connect's abort arriving after the
+                    // reciprocal accept has already taken ownership of the
+                    // state. Resetting to Idle here would erase that live
+                    // exchange's bookkeeping; its own finish will do the
+                    // resetting. Report nothing and leave the state alone.
+                    warn!(actual = ?origin, expected = ?origin2, "finished sync origin does not match state; leaving the running exchange in place");
+                    return None;
                 }
                 Some(*start)
             }
@@ -269,5 +276,65 @@ mod tests {
         assert!(state.start_connect(SyncReason::DirectJoin));
         assert!(!state.start_connect(SyncReason::NewNeighbor));
         assert!(state.resync_requested);
+    }
+
+    /// A rejected connect's abort, arriving while the state is still
+    /// `Running{Connect}`, must reset it — otherwise every later attempt is
+    /// refused as "already running" forever (the AlreadySyncing wedge).
+    #[test]
+    fn an_aborted_connect_resets_the_state_for_the_next_attempt() {
+        let mut state = PeerState::default();
+        assert!(state.start_connect(SyncReason::DirectJoin));
+        let finished = state.finish(
+            &Origin::Connect(SyncReason::DirectJoin),
+            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing").into()),
+        );
+        assert!(finished.is_some(), "the connect's own abort finishes it");
+        assert!(
+            state.start_connect(SyncReason::DirectJoin),
+            "the state must be Idle again so a later attempt can run",
+        );
+    }
+
+    /// The same abort arriving AFTER the reciprocal accept has taken
+    /// ownership must NOT erase that live exchange.
+    #[test]
+    fn a_stale_connect_abort_does_not_erase_a_running_accept() {
+        // Two real keys, ordered so me > other: an incoming request while we
+        // dial is then ACCEPTED and takes over the state
+        // (`expected_sync_direction` = Accept).
+        let (me, other) = {
+            let a = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+            let b = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+            if a.as_bytes() > b.as_bytes() { (a, b) } else { (b, a) }
+        };
+        let mut state = PeerState::default();
+        assert!(state.start_connect(SyncReason::DirectJoin));
+        assert!(matches!(
+            state.accept_request(&me, &other),
+            AcceptOutcome::Allow
+        ));
+        // Our own connect's abort now lands, late.
+        let finished = state.finish(
+            &Origin::Connect(SyncReason::DirectJoin),
+            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing").into()),
+        );
+        assert!(
+            finished.is_none(),
+            "a stale connect abort must not finish the accept exchange",
+        );
+        assert!(
+            matches!(
+                state.state,
+                SyncState::Running {
+                    origin: Origin::Accept,
+                    ..
+                }
+            ),
+            "the accept exchange still owns the state",
+        );
+        // The accept's own finish still works and resets to Idle.
+        assert!(state.finish(&Origin::Accept, Err(anyhow::anyhow!("x").into())).is_some());
+        assert!(state.start_connect(SyncReason::Resync));
     }
 }
