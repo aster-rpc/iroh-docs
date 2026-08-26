@@ -18,9 +18,10 @@ use super::{
         GetManyResponse, GetManyVecRequest, GetSyncPeersRequest, GetSyncPeersResponse,
         ImportRequest, ImportResponse, LeaveRequest, LeaveResponse, ListRequest, ListResponse,
         OpenRequest, OpenResponse, RetireWriteAuthorityRequest, RetireWriteAuthorityResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
-        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
-        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
+        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetDurableRequest, SetHashRequest,
+        SetHashResponse, SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse,
+        StartSyncRequest, StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest,
+        SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -117,6 +118,13 @@ impl RpcActor {
                 let result = self.doc_set_hash(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send SetHash response: {}", e);
+                }
+            }
+            DocsMessage::SetDurable(set) => {
+                let WithChannels { tx, inner, .. } = set;
+                let result = self.doc_set_durable(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send SetDurable response: {}", e);
                 }
             }
             DocsMessage::Get(get) => {
@@ -527,6 +535,56 @@ impl RpcActor {
             .temp_tag()
             .await
             .map_err(|e| RpcError::new(&e))?;
+        self.sync
+            .insert_local(doc_id, author_id, key.clone(), tag.hash(), len as u64)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        let entry = self
+            .sync
+            .get_exact(doc_id, author_id, key, false)
+            .await
+            .map_err(|e| RpcError::new(&*e))?
+            .ok_or_else(|| RpcError::new(&*anyhow!("failed to get entry after insertion")))?;
+        Ok(SetResponse { entry })
+    }
+
+    /// [`Self::doc_set`] with a durability barrier between the content import
+    /// and the document-record insert.
+    ///
+    /// `add_bytes` is acknowledged by the blob store's metadata actor while
+    /// its write transaction is still open; the commit happens later, on the
+    /// actor's own batching schedule. Publishing the hash into the document
+    /// store before that commit creates a crash window in which the document
+    /// record becomes durable first — a hard kill then leaves a record naming
+    /// blob metadata that was never committed, and the content is
+    /// unretrievable locally even though the entry claims it exists.
+    ///
+    /// `sync_db` is a top-level blob-store command: the metadata actor only
+    /// reaches it after committing the open write batch, which also covers
+    /// every import the caller completed on this store before this call. The
+    /// barrier is placed *before* `insert_local` because that is the only
+    /// direction that matters: if the process dies after the barrier but
+    /// before the record commits, the record is simply absent — nothing
+    /// dangles, and the caller retries. (This orders the two stores' commits;
+    /// it is not a power-loss guarantee for the data files themselves.)
+    ///
+    /// [`Self::doc_set_hash`] deliberately has no durable variant: its
+    /// contract is a reference to content this node may not hold at all.
+    pub(super) async fn doc_set_durable(&self, req: SetDurableRequest) -> RpcResult<SetResponse> {
+        let blobs_store = self.blob_store();
+        let SetDurableRequest {
+            doc_id,
+            author_id,
+            key,
+            value,
+        } = req;
+        let len = value.len();
+        let tag = blobs_store
+            .add_bytes(value)
+            .temp_tag()
+            .await
+            .map_err(|e| RpcError::new(&e))?;
+        blobs_store.sync_db().await.map_err(|e| RpcError::new(&e))?;
         self.sync
             .insert_local(doc_id, author_id, key.clone(), tag.hash(), len as u64)
             .await

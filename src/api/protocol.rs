@@ -130,6 +130,18 @@ pub struct SetResponse {
     pub entry: SignedEntry,
 }
 
+/// Like [`SetRequest`], but the blob store's metadata is committed to disk
+/// before the document record is inserted, so a process killed at any point
+/// can never leave a durable document record naming blob metadata that was
+/// never committed.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SetDurableRequest {
+    pub doc_id: NamespaceId,
+    pub author_id: AuthorId,
+    pub key: Bytes,
+    pub value: Bytes,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SetHashRequest {
     pub doc_id: NamespaceId,
@@ -391,6 +403,10 @@ pub enum DocsProtocol {
     AuthorExport(AuthorExportRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<AuthorDeleteResponse>>)]
     AuthorDelete(AuthorDeleteRequest),
+    // Keep additions at the end: the serialized form is positional, and
+    // inserting a variant above renumbers everything after it.
+    #[rpc(tx = oneshot::Sender<RpcResult<SetResponse>>)]
+    SetDurable(SetDurableRequest),
 }
 
 /// Options to configure what is included in a [`iroh::EndpointAddr`].
