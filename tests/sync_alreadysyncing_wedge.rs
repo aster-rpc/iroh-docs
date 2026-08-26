@@ -87,7 +87,11 @@ async fn connect_rejected_as_already_syncing_must_not_wedge_forever() -> Result<
     let wedged_store = iroh_blobs::store::mem::MemStore::new();
     let wedged_gossip = Gossip::builder().spawn(wedged_ep.clone());
     let wedged_docs = iroh_docs::protocol::Docs::memory()
-        .spawn(wedged_ep.clone(), (*wedged_store).clone(), wedged_gossip.clone())
+        .spawn(
+            wedged_ep.clone(),
+            (*wedged_store).clone(),
+            wedged_gossip.clone(),
+        )
         .await?;
     // Deliberately NO `.accept(iroh_docs::ALPN, …)`: see module docs.
     let wedged_router = iroh::protocol::Router::builder(wedged_ep.clone())

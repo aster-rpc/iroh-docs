@@ -287,7 +287,7 @@ mod tests {
         assert!(state.start_connect(SyncReason::DirectJoin));
         let finished = state.finish(
             &Origin::Connect(SyncReason::DirectJoin),
-            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing").into()),
+            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing")),
         );
         assert!(finished.is_some(), "the connect's own abort finishes it");
         assert!(
@@ -306,7 +306,11 @@ mod tests {
         let (me, other) = {
             let a = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
             let b = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-            if a.as_bytes() > b.as_bytes() { (a, b) } else { (b, a) }
+            if a.as_bytes() > b.as_bytes() {
+                (a, b)
+            } else {
+                (b, a)
+            }
         };
         let mut state = PeerState::default();
         assert!(state.start_connect(SyncReason::DirectJoin));
@@ -317,7 +321,7 @@ mod tests {
         // Our own connect's abort now lands, late.
         let finished = state.finish(
             &Origin::Connect(SyncReason::DirectJoin),
-            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing").into()),
+            Err(anyhow::anyhow!("remote aborted sync: AlreadySyncing")),
         );
         assert!(
             finished.is_none(),
@@ -334,7 +338,9 @@ mod tests {
             "the accept exchange still owns the state",
         );
         // The accept's own finish still works and resets to Idle.
-        assert!(state.finish(&Origin::Accept, Err(anyhow::anyhow!("x").into())).is_some());
+        assert!(state
+            .finish(&Origin::Accept, Err(anyhow::anyhow!("x")))
+            .is_some());
         assert!(state.start_connect(SyncReason::Resync));
     }
 }
